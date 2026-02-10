@@ -1,0 +1,11 @@
+# Python
+__pycache__
+*.pyc
+*.egg-info
+dist
+*.so
+
+build/
+
+/.sumi/
+/.ruff_cache/

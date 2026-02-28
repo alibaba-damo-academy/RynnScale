@@ -29,6 +29,16 @@ void grouped_linear_backward_dw(
 );
 
 
+void fused_rope_forward(
+	at::Tensor q,
+	at::Tensor k,
+	at::Tensor cos,
+	at::Tensor sin,
+	at::Tensor q_out,
+	at::Tensor k_out
+);
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	m.def(
 		"grouped_linear_forward",
@@ -55,5 +65,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		pybind11::arg("grad_output"),
 		pybind11::arg("grad_weight"),
 		pybind11::arg("input_group_sizes")
+	);
+	m.def(
+		"fused_rope_forward",
+		&fused_rope_forward,
+		pybind11::arg("q"),
+		pybind11::arg("k"),
+		pybind11::arg("cos"),
+		pybind11::arg("sin"),
+		pybind11::arg("q_out"),
+		pybind11::arg("k_out")
 	);
 }

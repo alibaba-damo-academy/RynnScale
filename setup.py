@@ -18,6 +18,7 @@ ext_modules = [
         sources=[
             "rynn_scale/ops/csrc/bindings.cpp",
             "rynn_scale/ops/csrc/grouped_linear_sm90.cu",
+            "rynn_scale/ops/csrc/rope_sm90.cu",
         ],
         include_dirs=[
             os.path.join(CUTLASS_DIR, "include"),

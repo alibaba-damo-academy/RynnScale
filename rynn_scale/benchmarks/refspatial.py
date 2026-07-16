@@ -1,15 +1,15 @@
-import os
 import io
+import json
+import os
+import re
 import traceback
 
-import json
 import numpy as np
 import pandas as pd
 from PIL import Image
-import re
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 @BENCHMARK_REGISTRY.register()

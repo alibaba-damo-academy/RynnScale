@@ -8,22 +8,23 @@ def cross_entropy_loss(
     position_ids,
     labels,
     num_items_in_batch,
+    sequence_splitter,
     loss_reduction_scope,
     loss_implementation,
 ):
     batch_size = hidden_states.size(0)
 
-    shift_hidden_states = hidden_states[..., :-1, :]
-    shift_labels = labels[..., 1:]
-    mask = shift_labels >= 0
-    shift_hidden_states = shift_hidden_states[mask].contiguous()
-    shift_labels = shift_labels[mask].contiguous()
+    shift_labels = F.pad(labels[..., 1:], (0, 1), value=-100)
+    global_mask = shift_labels >= 0
+    mask = global_mask[:, sequence_splitter]
 
     if mask.sum() == 0:
-        print(f"Get labels={labels}. Found no sample to calculate loss!")
-        pseudo_logits = lm_head(hidden_states[:, 0:1])
-        loss = 0.0 * pseudo_logits.mean()
+        logits = lm_head(hidden_states[:, :1])
+        loss = 0.0 * logits.mean()
         return loss
+
+    hidden_states = hidden_states[mask].contiguous()
+    shift_labels = shift_labels[:, sequence_splitter][mask].contiguous()
 
     if num_items_in_batch is None:
         reduction = "mean"
@@ -57,18 +58,17 @@ def cross_entropy_loss(
             batch_indices = torch.arange(batch_size, device=position_ids.device)
             batch_indices = batch_indices.unsqueeze(1).expand(-1, hidden_states.size(1))
 
-        shift_batch_indices = batch_indices[..., :-1]
-        shift_batch_indices = shift_batch_indices[mask].contiguous()
-        num_tokens = F.one_hot(shift_batch_indices).sum(dim=0)
-        denominator = num_tokens[shift_batch_indices] * num_items_in_batch
+        num_tokens = F.one_hot(batch_indices[global_mask]).sum(dim=0)
+        batch_indices = batch_indices[:, sequence_splitter][mask]
+        denominator = num_tokens[batch_indices] * num_items_in_batch
 
     else:
         raise ValueError(f"Unknown reduction scope: {loss_reduction_scope}")
 
     if loss_implementation == "torch":
-        shift_logits = lm_head(shift_hidden_states)
+        logits = lm_head(hidden_states)
         loss = torch.nn.functional.cross_entropy(
-            shift_logits.float(),
+            logits.float(),
             shift_labels,
             reduction=reduction,
         )
@@ -76,7 +76,7 @@ def cross_entropy_loss(
         from cut_cross_entropy import linear_cross_entropy
 
         loss = linear_cross_entropy(
-            shift_hidden_states,
+            hidden_states,
             lm_head.weight,
             shift_labels,
             bias=lm_head.bias,

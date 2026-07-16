@@ -5,7 +5,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 MOE_GEMM_BACKEND = os.environ.get("MOE_GEMM_BACKEND", "cutlass")
 
 

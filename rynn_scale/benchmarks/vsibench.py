@@ -3,8 +3,8 @@ import re
 
 import pyarrow.parquet as pq
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 @BENCHMARK_REGISTRY.register()
@@ -157,6 +157,8 @@ class VSIBench(BaseBenchmark):
         return prediction
 
     async def get_matching_score(self, data_id, prediction):
+        if prediction is None:
+            return 0.0
         metadata = self.data_dict[data_id]
         ground_truth = metadata["ground_truth"]
         if metadata["options"] is not None:

@@ -1,8 +1,8 @@
 import json
 import os
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 def make_prompt(question, label_answer, pred_answer):
@@ -186,7 +186,7 @@ class ECBench(BaseBenchmark):
             completion = await self.openai_client.chat.completions.create(
                 model="gpt-4o-0806",
                 messages=messages,
-                max_tokens=100,
+                max_completion_tokens=100,
             )
             response = completion.choices[0].message.content
             response = response.split("###Judge:")[1].strip()

@@ -2,8 +2,8 @@ import asyncio
 
 from datasets import load_dataset
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 @BENCHMARK_REGISTRY.register()
@@ -47,7 +47,7 @@ class RealWorldQA(BaseBenchmark):
                     model="gpt-4o-mini-0718",
                     messages=messages,
                     temperature=0.7,
-                    max_tokens=800,
+                    max_completion_tokens=800,
                     top_p=0.95,
                     frequency_penalty=0,
                     presence_penalty=0,

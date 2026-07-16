@@ -1,18 +1,16 @@
 import numpy as np
 from PIL import Image
-from transformers import Qwen3VLProcessor, Qwen3VLForConditionalGeneration
+from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from transformers.feature_extraction_utils import BatchFeature
+from transformers.image_transforms import resize
+from transformers.image_utils import get_image_size, load_images
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize as image_smart_resize
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import smart_resize as video_smart_resize
-from transformers.image_utils import load_images
-from transformers.image_utils import get_image_size
-from transformers.image_transforms import resize
-from transformers.feature_extraction_utils import BatchFeature
 
-from .base import BaseInferenceWrapper
 from ..registry import INFERENCE_WRAPPER_REGISTRY
-from ..utils.processing import load_video
 from ..utils import logging
-
+from ..utils.processing import load_video
+from .base import BaseInferenceWrapper
 
 logger = logging.get_logger(__file__)
 
@@ -24,7 +22,7 @@ class Qwen3VLInferenceWrapper(BaseInferenceWrapper):
             self.model_path,
             dtype=self.dtype,
             attn_implementation=self.attn_implementation,
-            device_map={"": "cuda:0"},
+            device_map="auto",
         )
         return model
 
@@ -187,7 +185,11 @@ class Qwen3VLInferenceWrapper(BaseInferenceWrapper):
 
         text = text.replace("<|placeholder|>", self.processor.video_token)
 
-        text_inputs = self.processor.tokenizer(text, return_tensors="pt")
+        text_inputs = self.processor.tokenizer(
+            [text],
+            padding=False,
+            return_token_type_ids=False,
+        )
         self.processor._check_special_mm_tokens([text], text_inputs, modalities=["image", "video"])
 
         model_inputs = {

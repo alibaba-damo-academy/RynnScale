@@ -1,7 +1,9 @@
-from typing import Dict, List, Any
+from typing import Any, Dict, List
 
 import torch
 from transformers import ProcessorMixin
+
+from ..utils import context_parallel
 
 
 class DataCollator(object):
@@ -27,22 +29,35 @@ class DataCollator(object):
         return mm_inputs
 
     def _collate_fn_packing(self, instances):
-        input_ids, position_ids, labels = [], [], []
+        input_ids_list, position_ids_list, labels_list = [], [], []
 
         cu_seq_lens = [0]
         max_length = 0
 
         for instance in instances:
-            input_ids.append(instance["input_ids"])
-            if "position_ids" in instance:
-                position_ids.append(instance["position_ids"])
-            else:
-                position_ids.append(torch.arange(instance["input_ids"].size(-1)).unsqueeze(0))
-            tmp_labels = instance["labels"].clone()
-            tmp_labels[..., 0] = -100
-            labels.append(tmp_labels)
+            input_ids = instance.get("input_ids")
+            position_ids = instance.get(
+                "position_ids", torch.arange(instance["input_ids"].size(-1)).unsqueeze(0)
+            )
+            labels = instance.get("labels", None)
 
-            seq_len = instance["input_ids"].size(-1)
+            if "labels" in instance:
+                labels = instance["labels"].clone()
+                labels[..., 0] = -100
+            else:
+                labels = None
+
+            input_ids, _, position_ids, labels = context_parallel.pad_sequence(
+                input_ids,
+                position_ids=position_ids,
+                labels=labels,
+            )
+
+            input_ids_list.append(input_ids)
+            position_ids_list.append(position_ids)
+            labels_list.append(labels)
+
+            seq_len = input_ids.size(-1)
             cu_seq_lens.append(cu_seq_lens[-1] + seq_len)
             max_length = max(max_length, seq_len)
 
@@ -50,9 +65,9 @@ class DataCollator(object):
 
         batch = {
             "data_indices": [instance["data_index"] for instance in instances],
-            "input_ids": torch.cat(input_ids, dim=-1),
-            "position_ids": torch.cat(position_ids, dim=-1),
-            "labels": torch.cat(labels, dim=-1),
+            "input_ids": torch.cat(input_ids_list, dim=-1),
+            "position_ids": torch.cat(position_ids_list, dim=-1),
+            "labels": torch.cat(labels_list, dim=-1),
             "use_cache": False,
             **self._collate_mm_inputs(instances),
             "cu_seq_lens_q": cu_seq_lens,

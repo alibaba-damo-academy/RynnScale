@@ -1,11 +1,14 @@
+import io
 import os
-from typing import List, Dict, Any, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import ffmpeg
 import numpy as np
 from PIL import Image
-from transformers.image_utils import load_image
+from transformers.image_utils import load_image as _load_image
 from transformers.video_utils import VideoMetadata
+
+from . import oss
 
 
 def read_video_ffmpeg(
@@ -17,6 +20,9 @@ def read_video_ffmpeg(
     precise_time: bool = False,
     verbose: bool = False,
 ):
+    if video.startswith("oss://"):
+        video = oss.sign_url(video)
+
     probe = ffmpeg.probe(video)
     duration = float(probe["format"]["duration"])
     video_stream = next((stream for stream in probe["streams"] if stream["codec_type"] == "video"), None)
@@ -88,7 +94,10 @@ def read_video_frames(
     **kwargs,
 ):
     if isinstance(video, str):
-        frames = sorted([os.path.join(video, x) for x in os.listdir(video) if x.endswith((".jpg", ".jpeg", ".png"))])
+        if video.startswith("oss://"):
+            frames = sorted([os.path.join(video, x) for x in oss.listdir(video) if x.endswith((".jpg", ".jpeg", ".png"))])
+        else:
+            frames = sorted([os.path.join(video, x) for x in os.listdir(video) if x.endswith((".jpg", ".jpeg", ".png"))])
     else:
         frames = video
 
@@ -125,7 +134,7 @@ def read_video_frames(
     if max_frames is not None and len(frames_indices) > max_frames:
         frames_indices = [frames_indices[round(i)] for i in np.linspace(0, len(frames_indices) - 1, max_frames)]
 
-    frames = [Image.open(frames[i]).convert("RGB") for i in frames_indices]
+    frames = [load_image(frames[i]).convert("RGB") for i in frames_indices]
     metadata = VideoMetadata(
         total_num_frames=total_num_frames,
         fps=video_fps,
@@ -143,7 +152,14 @@ def load_video(
     precise_time: bool = False,
     verbose: bool = False,
 ):
-    if isinstance(video, (list, tuple)) or os.path.isdir(video):
+    if isinstance(video, (list, tuple)):
+        is_frames = True
+    elif video.startswith("oss://"):
+        is_frames = oss.isdir(video)
+    else:
+        is_frames = os.path.isdir(video)
+
+    if is_frames:
         return read_video_frames(
             video=video,
             start_time=start_time,
@@ -163,24 +179,37 @@ def load_video(
     )
 
 
+def load_image(image: str | Image.Image):
+    if isinstance(image, str) and image.startswith("oss://"):
+        with oss.get_object(image) as result:
+            buffer = io.BytesIO(result.read())
+        image = Image.open(buffer)
+        image.load()
+        buffer.close()
+        return image
+    return _load_image(image)
+
+
 def load_multimodal_data(
     conversation: List[Dict[str, Any]],
     fps: int = 1,
     max_frames: Optional[int] = None,
 ):
-    new_conversation = []
+    images, videos, video_metadatas = [], [], []
     for message in conversation:
-        contents = []
         for content in message["content"]:
-            new_content = {"type": content["type"]}
             if content["type"] == "image":
-                new_content["image"] = load_image(content["image"])
+                images.append(load_image(content["image"]))
             elif content["type"] == "video":
-                new_content["video"] = load_video(content["video"], fps=fps, max_frames=max_frames)
+                video, video_metadata = load_video(content["video"], fps=fps, max_frames=max_frames)
+                videos.append(video)
+                video_metadatas.append(video_metadata)
             elif content["type"] == "text":
-                new_content["text"] = content["text"]
+                pass
             else:
                 raise ValueError(f"Unsupported content type: {content['type']}")
-            contents.append(new_content)
-        new_conversation.append({"role": message["role"], "content": contents})
-    return new_conversation
+    return (
+        images if len(images) > 0 else None,
+        videos if len(videos) > 0 else None,
+        video_metadatas if len(video_metadatas) > 0 else None,
+    )

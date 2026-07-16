@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import List, Optional
 
 
 class Registry(object):
@@ -30,6 +30,9 @@ class Registry(object):
         if name not in self._objects:
             raise KeyError(f"Object {name} is not registered.")
         return self._objects[name]
+
+    def __contains__(self, item):
+        return item in self._objects
 
 
 DATASET_REGISTRY = Registry()

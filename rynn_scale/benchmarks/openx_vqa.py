@@ -1,11 +1,11 @@
+import ast
 import os
 import re
-import ast
 
 from datasets import load_dataset
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 @BENCHMARK_REGISTRY.register()

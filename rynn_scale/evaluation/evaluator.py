@@ -1,20 +1,20 @@
 import asyncio
+import json
 import os
-from datetime import datetime
-from typing import Any, Dict, List, Union
 import random
 from collections import defaultdict
+from datetime import datetime
+from typing import Any, Dict, List, Union
 
 import ray
-import json
 import zmq
 from ray.util.queue import Queue
 from tqdm import tqdm
 
-from .vlm_worker import VLMWorker
 from ..arguments import EvaluationArguments
 from ..benchmarks import BaseBenchmark
 from ..inference_wrappers import BaseInferenceWrapper
+from .vlm_worker import VLMWorker
 
 
 def filter_metadata(data: Union[Dict[str, Any], List[Any]]) -> Union[Dict[str, Any], List[Any]]:
@@ -169,18 +169,22 @@ class Evaluator(object):
         resources = ray.cluster_resources()
         num_gpus = int(resources.get("GPU", 0))
 
+        num_gpus_per_worker = self.args.tensor_parallel_size * self.args.pipeline_parallel_size
+        num_workers = num_gpus // num_gpus_per_worker
+
         model_workers = []
         model_endpoints = []
         request_queues = []
         result_queue = Queue()
 
-        for i in range(num_gpus):
+        for i in range(num_workers):
             request_queue = Queue(maxsize=8)
-            model_worker = VLMWorker.remote(
+            model_worker = VLMWorker.options(num_gpus=num_gpus_per_worker).remote(
                 backend=self.args.backend,
                 inference_wrapper=self.inference_wrapper,
                 processing_params=self.args.processing_params,
                 sampling_params=self.args.sampling_params,
+                parallel_params=self.args.parallel_params,
                 num_processor_workers=self.args.num_processor_workers,
                 input_queue=request_queue,
                 output_queue=result_queue,
@@ -208,6 +212,8 @@ class Evaluator(object):
         )
         results = await collector.start()
 
+        prefix = datetime.now().strftime("%Y%m%d%H%M%S")
+
         for name in benchmarks:
             benchmark = benchmarks[name]
             metrics = benchmark.compute_metrics(results[name])
@@ -215,7 +221,7 @@ class Evaluator(object):
             print("=" * 20, f"Results on {name}", "=" * 20)
             print(json.dumps(metrics, indent=4))
 
-            save_path = os.path.join(self.args.save_dir, f"{name}.json")
+            save_path = os.path.join(self.args.save_dir, f"{prefix}_{name}.json")
 
             for result in results[name]:
                 result["metadata"] = benchmark.data_dict[result["data_id"]]
@@ -228,6 +234,8 @@ class Evaluator(object):
                         "model_path": self.args.model_path,
                         "benchmark": name,
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+                        "prompt_format": self.args.prompt_format,
+                        "enable_thinking": self.args.enable_thinking,
                         "sampling_params": self.args.sampling_params,
                         "processing_params": self.args.processing_params,
                         "metrics": metrics,

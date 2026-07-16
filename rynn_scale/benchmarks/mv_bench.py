@@ -2,9 +2,8 @@ import json
 import os
 import re
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
-
+from .base import BaseBenchmark
 
 TASKS = {
     "Action Sequence": ("action_sequence.json", "star/Charades_v1_480/", "video", True),  # has start & end

@@ -1,56 +1,63 @@
-import inspect
 import contextlib
-import os
-import time
 import functools
-import random
+import gc
+import inspect
+import io
 import math
+import os
+import random
 import re
 import sys
+import time
+from collections import defaultdict
 from dataclasses import dataclass
-from packaging import version
-from typing import Any, Union, Optional, List, Dict, Iterator
+from typing import Iterator, List, Optional, Union
 
 import deepspeed
 import numpy as np
+import shutil
 import torch
 import torch.nn as nn
 from deepspeed.runtime.checkpoint_engine import CheckpointCommitInfo
-from torch.utils.data import Dataset, IterableDataset, DataLoader
-from transformers.trainer import (
-    PreTrainedModel,
-    DataCollator,
-    PreTrainedTokenizerBase,
-    BaseImageProcessor,
-    FeatureExtractionMixin,
-    ProcessorMixin,
-    TrainerMemoryTracker,
-    enable_full_determinism,
-    set_seed,
-    DEFAULT_CALLBACKS,
-    get_reporting_integration_callbacks,
-    TrainerCallback,
-    CallbackHandler,
-    TrainerControl,
-    TrainerState as _TrainerState,
-    ExportableState,
-    get_model_param_count,
-    TRAINER_STATE_NAME,
-    SCHEDULER_NAME,
-    speed_metrics,
-    TrainOutput,
-    seed_worker,
-    PrinterCallback,
-    DEFAULT_PROGRESS_CALLBACK,
-)
+from deepspeed.runtime.zero.partition_parameters import GatheredParameters
+from packaging import version
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from transformers import Trainer as _Trainer
+from transformers.trainer import (
+    DEFAULT_CALLBACKS,
+    DEFAULT_PROGRESS_CALLBACK,
+    SCHEDULER_NAME,
+    TRAINER_STATE_NAME,
+    BaseImageProcessor,
+    CallbackHandler,
+    DataCollator,
+    ExportableState,
+    FeatureExtractionMixin,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+    PrinterCallback,
+    ProcessorMixin,
+    TrainerCallback,
+    TrainerControl,
+    TrainerMemoryTracker,
+    TrainOutput,
+    enable_full_determinism,
+    get_model_param_count,
+    get_reporting_integration_callbacks,
+    seed_worker,
+    set_seed,
+    speed_metrics,
+)
+from transformers.trainer import (
+    TrainerState as _TrainerState,
+)
 
-from .sampler import DistributedBatchSampler
+from . import callbacks
 from ..arguments import TrainingArguments
-from ..utils.pipeline_parallel import PipelineStage, PipelineModule, ALL_PIPELINE_SCHEDULES
-from ..utils.expert_parallel import BaseMoELayer
-from ..utils import logging
-
+from ..utils import logging, oss
+from ..utils.expert_parallel import BaseMoELayer, gather_ep_params
+from ..utils.pipeline_parallel import ALL_PIPELINE_SCHEDULES, PipelineModule, PipelineStage, gather_pp_params
+from .sampler import DistributedBatchSampler
 
 logger = logging.get_logger(__name__)
 
@@ -70,14 +77,41 @@ def has_length(dataset):
 
 
 def get_last_checkpoint(folder):
-    content = os.listdir(folder)
-    pattern = re.compile(r"^" + "checkpoint" + r"\-(\d+)$")
-    checkpoints = [
-        path for path in content if pattern.search(path) is not None and os.path.isdir(os.path.join(folder, path))
-    ]
+    if folder.startswith("oss://"):
+        content = oss.listdir(folder)
+    else:
+        content = os.listdir(folder)
+    pattern = re.compile("checkpoint" + r"\-(\d+)$")
+    checkpoints = [path for path in content if pattern.search(path) is not None]
     if len(checkpoints) == 0:
         return
     return os.path.join(folder, max(checkpoints, key=lambda x: int(pattern.search(x).groups()[0])))
+
+
+def rotate_checkpoints(output_dir: str, save_total_limit: Optional[int] = None):
+    if save_total_limit is None or save_total_limit <= 0:
+        return
+
+    if output_dir.startswith("oss://"):
+        content = oss.listdir(output_dir)
+    else:
+        content = os.listdir(output_dir)
+
+    pattern = re.compile("checkpoint" + r"\-(\d+)$")
+    checkpoints = sorted(
+        [path for path in content if pattern.search(path) is not None],
+        key=lambda x: int(pattern.search(x).groups()[0])
+    )
+
+    if len(checkpoints) <= save_total_limit:
+        return
+
+    for checkpoint in checkpoints[:-save_total_limit]:
+        checkpoint = os.path.join(output_dir, checkpoint)
+        if checkpoint.startswith("oss://"):
+            oss.rmtree(checkpoint)
+        else:
+            shutil.rmtree(checkpoint, ignore_errors=True)
 
 
 def safe_globals():
@@ -99,6 +133,203 @@ def safe_globals():
     return torch.serialization.safe_globals(allowlist)
 
 
+class LazyBatchLoader(object):
+    _torch_dtype_map = {
+        str(dtype): dtype for dtype in [
+            torch.float, torch.float32, torch.float16, torch.bfloat16,
+            torch.long, torch.int64, torch.int32, torch.int16, torch.int8,
+            torch.uint64, torch.uint32, torch.uint16, torch.uint8, torch.bool,
+        ]
+    }
+
+    def __init__(
+        self,
+        epoch_iterator: Iterator,
+        num_batches: int,
+        training_args: TrainingArguments,
+    ):
+        self.epoch_iterator = epoch_iterator
+        self.num_batches = num_batches
+        self.args = training_args
+
+        self._batch_samples = []
+
+    def __len__(self):
+        return self.num_batches
+
+    def _load_one_batch(self):
+        assert len(self._batch_samples) < self.num_batches
+
+        if (not self.args.cp_broadcast_data or self.args.cp_rank == 0) and \
+            (not self.args.pp_broadcast_data or self.args.pp_rank == 0):
+            batch = next(self.epoch_iterator)
+        else:
+            batch = {}
+
+        if self.args.cp_broadcast_data and (not self.args.pp_broadcast_data or self.args.pp_rank == 0):
+            if self.args.cp_rank == 0:
+                meta_data = defaultdict(list)
+                for key, value in batch.items():
+                    if torch.is_tensor(value):
+                        meta_data[str(value.dtype)].append((key, tuple(value.shape)))
+                    else:
+                        meta_data["others"].append((key, value))
+            else:
+                meta_data = None
+
+            meta_data = [meta_data]
+            torch.distributed.broadcast_object_list(
+                meta_data,
+                group=self.args.cp_group,
+                group_src=0,
+            )
+            meta_data = meta_data[0]
+
+            others = meta_data.pop("others", [])
+            if self.args.cp_rank != 0:
+                for key, value in others:
+                    batch[key] = value
+
+            for dtype, items in meta_data.items():
+                dtype = self._torch_dtype_map[dtype]
+                sizes = [math.prod(shape) for _, shape in items]
+
+                if self.args.cp_rank == 0:
+                    flattened_tensors = []
+                    for key, _ in items:
+                        batch[key] = batch[key].to(self.args.device)
+                        flattened_tensors.append(batch[key].flatten())
+                    buffer = torch.cat(flattened_tensors, dim=0)
+                else:
+                    buffer = torch.empty(sum(sizes), dtype=dtype, device=self.args.device)
+
+                torch.distributed.broadcast(
+                    buffer,
+                    group=self.args.cp_group,
+                    group_src=0,
+                )
+
+                if self.args.cp_rank != 0:
+                    buffers = buffer.split(sizes, dim=0)
+                    for (key, shape), tensor in zip(items, buffers):
+                        batch[key] = tensor.view(shape)
+
+        if self.args.pp_broadcast_data:
+            cu_seq_lens = torch.empty(
+                (self.args.micro_batch_size * self.args.dp_world_size + 2,),
+                dtype=torch.int32,
+                device=self.args.device,
+            )
+
+            if self.args.pp_rank == 0:
+                cu_seq_lens[-1] = len(batch["cu_seq_lens_q"])
+                cu_seq_lens[:len(batch["cu_seq_lens_q"])] = batch["cu_seq_lens_q"]
+
+            torch.distributed.broadcast(
+                cu_seq_lens,
+                group=self.args.pp_group,
+                group_src=0,
+            )
+            cu_seq_lens = cu_seq_lens[:cu_seq_lens[-1]]
+
+            if self.args.pp_rank == 0:
+                batch["position_ids"] = batch["position_ids"].to(self.args.device)
+                assert batch["position_ids"].size() == (3, 1, cu_seq_lens[-1])
+                assert batch["position_ids"].dtype == torch.long
+                position_ids = batch["position_ids"]
+                batch["labels"] = batch["labels"].to(self.args.device)
+                assert batch["labels"].size() == (1, cu_seq_lens[-1])
+                assert batch["labels"].dtype == torch.long
+                labels = batch["labels"]
+            else:
+                position_ids = torch.empty(
+                    (3, 1, cu_seq_lens[-1]),
+                    dtype=torch.long,
+                    device=self.args.device,
+                )
+                labels = torch.empty(
+                    (1, cu_seq_lens[-1]),
+                    dtype=torch.long,
+                    device=self.args.device,
+                )
+
+            torch.distributed.broadcast(
+                position_ids,
+                group=self.args.pp_group,
+                group_src=0,
+            )
+            torch.distributed.broadcast(
+                labels,
+                group=self.args.pp_group,
+                group_src=0,
+            )
+
+            if self.args.pp_rank != 0:
+                max_length = torch.amax(cu_seq_lens[1:] - cu_seq_lens[:-1]).item()
+                batch["cu_seq_lens_q"] = cu_seq_lens
+                batch["cu_seq_lens_k"] = cu_seq_lens
+                batch["max_length_q"] = max_length
+                batch["max_length_k"] = max_length
+                batch["position_ids"] = position_ids
+                batch["labels"] = labels
+
+        if self.args.synchronize_experts_before_forward:
+            torch.distributed.barrier(group=self.args.ep_group)
+
+        return batch
+
+    def __getitem__(self, index: int):
+        if index < 0 or index >= self.num_batches:
+            raise IndexError(f"Index {index} is out of range")
+
+        if index < len(self._batch_samples):
+            return self._batch_samples[index]
+
+        torch.cuda.nvtx.range_push("load_data")
+
+        num_batches = index - len(self._batch_samples) + 1
+        batch_samples = []
+
+        for _ in range(num_batches):
+            batch_samples.append(self._load_one_batch())
+
+        num_items_in_batch = None
+        count_num_items_in_batch = "labels" in batch_samples[0]
+
+        if count_num_items_in_batch:
+            if self.args.loss_reduction_scope == "batch":
+                num_batches = self.num_batches - len(self._batch_samples) - len(batch_samples)
+                for _ in range(num_batches):
+                    batch_samples.append(self._load_one_batch())
+
+                num_items_in_batch = sum((batch["labels"].ne(-100)).sum() for batch in batch_samples) / len(
+                    batch_samples
+                )
+                if self.args.average_tokens_across_devices and self.args.dp_world_size > 1:
+                    num_items_in_batch = num_items_in_batch.to(self.args.device)
+                    torch.distributed.all_reduce(
+                        num_items_in_batch,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=self.args.dp_group,
+                    )
+                    num_items_in_batch = num_items_in_batch / self.args.dp_world_size
+
+            elif self.args.loss_reduction_scope == "sequence":
+                num_items_in_batch = self.args.micro_batch_size
+
+            else:
+                raise ValueError(f"Unknown loss reduction scope: {self.args.loss_reduction_scope}")
+
+        for batch in batch_samples:
+            batch["num_items_in_batch"] = num_items_in_batch
+
+        self._batch_samples.extend(batch_samples)
+
+        torch.cuda.nvtx.range_pop()
+
+        return self._batch_samples[index]
+
+
 @dataclass
 class TrainerState(_TrainerState):
     num_input_tokens_seen: float = 0.0
@@ -111,8 +342,6 @@ class Trainer(object):
     get_optimizer_cls_and_kwargs = staticmethod(_Trainer.get_optimizer_cls_and_kwargs)
     _load_callback_state = _Trainer._load_callback_state
     _get_learning_rate = _Trainer._get_learning_rate
-    _sorted_checkpoints = _Trainer._sorted_checkpoints
-    _rotate_checkpoints = _Trainer._rotate_checkpoints
 
     def __init__(
         self,
@@ -173,7 +402,7 @@ class Trainer(object):
         self._loggers_initialized = False
 
         # Create distant repo and output directory if needed
-        if self.args.global_rank == 0:
+        if self.args.global_rank == 0 and not self.args.output_dir.startswith("oss://"):
             os.makedirs(self.args.output_dir, exist_ok=True)
 
         if not callable(self.data_collator) and callable(getattr(self.data_collator, "collate_batch", None)):
@@ -215,44 +444,6 @@ class Trainer(object):
         )
         self.processing_class = processing_class
 
-    @torch.cuda.nvtx.range("load_data")
-    def get_batch_samples(
-        self, epoch_iterator: Iterator, num_batches: int, device: torch.device
-    ) -> List[Dict[str, Any]]:
-        batch_samples = []
-        num_items_in_batch = None
-
-        for _ in range(num_batches):
-            try:
-                batch_samples.append(next(epoch_iterator))
-            except StopIteration:
-                break
-
-        count_num_items_in_batch = len(batch_samples) > 0 and "labels" in batch_samples[0]
-
-        if count_num_items_in_batch:
-            if self.args.loss_reduction_scope == "batch":
-                num_items_in_batch = sum((batch["labels"].ne(-100)).sum() for batch in batch_samples) / len(
-                    batch_samples
-                )
-                if self.args.average_tokens_across_devices and self.args.dp_world_size > 1:
-                    num_items_in_batch = num_items_in_batch.to(device)
-                    torch.distributed.all_reduce(
-                        num_items_in_batch,
-                        op=torch.distributed.ReduceOp.SUM,
-                        group=self.args.dp_group,
-                    )
-                    num_items_in_batch = num_items_in_batch / self.args.dp_world_size
-            elif self.args.loss_reduction_scope == "sequence":
-                num_items_in_batch = self.args.micro_batch_size
-            else:
-                raise ValueError(f"Unknown loss reduction scope: {self.args.loss_reduction_scope}")
-
-        for batch in batch_samples:
-            batch["num_items_in_batch"] = num_items_in_batch
-
-        return batch_samples
-
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
@@ -263,8 +454,18 @@ class Trainer(object):
         sampler_seed = torch.as_tensor(self.args.seed).cuda()
         torch.distributed.broadcast(sampler_seed, src=0)
 
+        if self.args.decoder_load_balancing or self.args.dynamic_batching:
+            assert hasattr(train_dataset, "get_sequence_lengths")
+            sequence_lengths = train_dataset.get_sequence_lengths(
+                num_workers=self.args.dataloader_num_workers,
+                cache_dir=self.args.output_dir,
+            )
+        else:
+            sequence_lengths = None
+
         batch_sampler = DistributedBatchSampler(
             train_dataset,
+            sequence_lengths=sequence_lengths,
             num_replicas=self.args.dp_world_size,
             rank=self.args.dp_rank,
             micro_batch_size=self.args.micro_batch_size,
@@ -278,6 +479,10 @@ class Trainer(object):
             model_max_length=self.args.model_max_length,
         )
 
+        def worker_init_fn(worker_id, num_workers, rank):
+            seed_worker(worker_id, num_workers=num_workers, rank=rank)
+            oss.clear_cache()
+
         dataloader_params = {
             "batch_sampler": batch_sampler,
             "collate_fn": data_collator,
@@ -285,7 +490,7 @@ class Trainer(object):
             "pin_memory": self.args.dataloader_pin_memory,
             "persistent_workers": self.args.dataloader_persistent_workers,
             "worker_init_fn": functools.partial(
-                seed_worker,
+                worker_init_fn,
                 num_workers=self.args.dataloader_num_workers,
                 rank=self.args.dp_rank,
             ),
@@ -390,24 +595,74 @@ class Trainer(object):
         self.create_optimizer()
         self.create_scheduler(num_training_steps=num_training_steps, optimizer=self.optimizer)
 
+    def _is_zero3(self):
+        return self.deepspeed_engine.zero_optimization_stage() == 3
+
     def _save_model(self, output_dir, full: bool = False):
-        if self.args.edp_rank != 0:
-            return
-        ckpt_name = f"model_pp_rank_{self.args.pp_rank:02d}_ep_rank_{self.args.ep_rank:02d}.pt"
-        torch.save(self.model.state_dict(), os.path.join(output_dir, ckpt_name))
+        if self.args.global_rank == 0:
+            self.model.config.save_pretrained(output_dir)
+            self.processing_class.save_pretrained(output_dir)
+
+        kwargs = {}
+        if "convert" in inspect.signature(self.model.state_dict).parameters:
+            kwargs["convert"] = False
+
+        if self._is_zero3():
+            state_dict = {
+                name: param.ds_tensor.clone().cpu()
+                for name, param in self.model.named_parameters()
+            }
+            ckpt_name = f"model_zero_pp_rank_{self.args.dp_rank}.pt"
+            torch.save(state_dict, os.path.join(output_dir, ckpt_name))
+        else:
+            if self.args.edp_rank != 0:
+                return
+            state_dict = self.model.state_dict(**kwargs)
+            ckpt_name = f"model_pp_rank_{self.args.pp_rank:02d}_ep_rank_{self.args.ep_rank:02d}.pt"
+            torch.save(state_dict, os.path.join(output_dir, ckpt_name))
 
     def _load_model(self, checkpoint):
-        ckpt_name = f"model_pp_rank_{self.args.pp_rank:02d}_ep_rank_{self.args.ep_rank:02d}.pt"
-        state_dict = torch.load(os.path.join(checkpoint, ckpt_name), map_location="cpu")
-        self.model.load_state_dict(state_dict, strict=True)
+        if self._is_zero3():
+            ckpt_name = f"model_zero_pp_rank_{self.args.dp_rank}.pt"
+            ckpt_path = os.path.join(checkpoint, ckpt_name)
+            if ckpt_path.startswith("oss://"):
+                with oss.get_object(ckpt_path) as result:
+                    buffer = io.BytesIO(result.read())
+                state_dict = torch.load(buffer, map_location="cpu")
+                buffer.close()
+            else:
+                state_dict = torch.load(ckpt_path, map_location="cpu")
 
-    def _save_optimizer_and_scheduler(self, output_dir):
+            for name, param in self.model.named_parameters():
+                if name in state_dict:
+                    param.ds_tensor.copy_(state_dict[name].to(param.ds_tensor.device))
+            return
+
+        if self.args.edp_rank == 0:
+            ckpt_name = f"model_pp_rank_{self.args.pp_rank:02d}_ep_rank_{self.args.ep_rank:02d}.pt"
+            ckpt_path = os.path.join(checkpoint, ckpt_name)
+            if ckpt_path.startswith("oss://"):
+                with oss.get_object(ckpt_path) as result:
+                    buffer = io.BytesIO(result.read())
+                state_dict = torch.load(buffer, map_location="cpu")
+                buffer.close()
+            else:
+                state_dict = torch.load(ckpt_path, map_location="cpu")
+
+            kwargs = {"strict": True}
+            if "convert" in inspect.signature(self.model.state_dict).parameters:
+                kwargs["convert"] = False
+            self.model.load_state_dict(state_dict, **kwargs)
+
+        self.model_wrapped._broadcast_model()
+
+    def _save_optimizer_and_scheduler(self, output_dir, is_tmp_dir):
         if hasattr(self.optimizer, "checkpoint_event_prologue"):
             self.optimizer.checkpoint_event_prologue()
 
         tag = f"global_step{self.state.global_step}"
         save_dir = os.path.join(output_dir, tag)
-        if self.args.global_rank == 0:
+        if self.args.global_rank == 0 or is_tmp_dir:
             os.makedirs(save_dir, exist_ok=True)
         torch.distributed.barrier()
 
@@ -439,24 +694,55 @@ class Trainer(object):
                 with open(os.path.join(output_dir, "latest"), "w") as fd:
                     fd.write(tag)
 
+        if self.args.global_rank == 0:
+            torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+
         torch.distributed.barrier()
-        torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
 
     def _load_optimizer_and_scheduler(self, checkpoint):
         if hasattr(self.optimizer, "checkpoint_event_prologue"):
             self.optimizer.checkpoint_event_prologue()
 
         latest_path = os.path.join(checkpoint, "latest")
-        if os.path.isfile(latest_path):
+        if latest_path.startswith("oss://"):
+            with oss.get_object(latest_path) as result:
+                tag = result.read().decode("utf-8").strip()
+        else:
             with open(latest_path, "r") as fd:
                 tag = fd.read().strip()
 
-        deepspeed_state = torch.load(os.path.join(checkpoint, "deepspeed_state.pt"))
+        deepspeed_state_path = os.path.join(checkpoint, "deepspeed_state.pt")
+        if deepspeed_state_path.startswith("oss://"):
+            with oss.get_object(deepspeed_state_path) as result:
+                buffer = io.BytesIO(result.read())
+            deepspeed_state = torch.load(buffer, map_location="cpu")
+            buffer.close()
+        else:
+            deepspeed_state = torch.load(deepspeed_state_path)
+
         self.model_wrapped.global_steps = deepspeed_state["global_steps"]
         self.model_wrapped.global_samples = deepspeed_state["global_samples"]
         self.model_wrapped.skipped_steps = deepspeed_state["skipped_steps"]
         self.model_wrapped.loaded_checkpoint_dp_world_size = deepspeed_state["dp_world_size"]
         self.model_wrapped.loaded_checkpoint_mp_world_size = deepspeed_state["mp_world_size"]
+
+        tmp_dir = None
+        if checkpoint.startswith("oss://"):
+            include = ["scheduler.pt"]
+
+            for bf16_mode in [self.model_wrapped.bfloat16_enabled(), not self.model_wrapped.bfloat16_enabled()]:
+                zero_ckpt_names = self.model_wrapped._get_all_zero_checkpoint_names(checkpoint, tag, bf16_mode)
+                if zero_ckpt_names is not None:
+                    for i, ckpt_name in enumerate(zero_ckpt_names):
+                        if torch.distributed.get_rank(group=self.optimizer.dp_process_group) == i:
+                            include.append(os.path.relpath(ckpt_name, checkpoint))
+
+            tmp_dir = oss.TemporaryDirectory(
+                oss_path=checkpoint,
+                mode="download",
+                include=include,
+            )
+            checkpoint = tmp_dir.name
 
         success = self.model_wrapped._load_zero_checkpoint(checkpoint, tag, load_optimizer_states=True)
         assert success
@@ -466,6 +752,9 @@ class Trainer(object):
 
         self.lr_scheduler.load_state_dict(torch.load(os.path.join(checkpoint, SCHEDULER_NAME), weights_only=True))
 
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
+
     def _save_rng_state(self, output_dir):
         # Save RNG state in non-distributed training
         rng_states = {
@@ -474,10 +763,6 @@ class Trainer(object):
             "cpu": torch.random.get_rng_state(),
             "cuda": torch.cuda.random.get_rng_state_all(),
         }
-
-        # A process can arrive here before the process 0 has a chance to save the model, in which case output_dir may
-        # not yet exist.
-        os.makedirs(output_dir, exist_ok=True)
         torch.save(rng_states, os.path.join(output_dir, f"rng_state_{self.args.global_rank}.pth"))
 
     def _load_rng_state(self, checkpoint):
@@ -486,14 +771,14 @@ class Trainer(object):
             return
 
         rng_file = os.path.join(checkpoint, f"rng_state_{self.args.global_rank}.pth")
-        if not os.path.isfile(rng_file):
-            raise ValueError(
-                f"Didn't find an RNG file for process {self.args.global_rank}, if you are resuming a training that "
-                "wasn't launched in a distributed fashion, reproducibility is not guaranteed."
-            )
-
         with safe_globals():
-            checkpoint_rng_state = torch.load(rng_file)
+            if rng_file.startswith("oss://"):
+                with oss.get_object(rng_file) as result:
+                    buffer = io.BytesIO(result.read())
+                checkpoint_rng_state = torch.load(buffer)
+                buffer.close()
+            else:
+                checkpoint_rng_state = torch.load(rng_file)
 
         random.setstate(checkpoint_rng_state["python"])
         np.random.set_state(checkpoint_rng_state["numpy"])
@@ -509,12 +794,17 @@ class Trainer(object):
         checkpoint_folder = f"checkpoint-{self.state.global_step}"
 
         output_dir = os.path.join(self.args.output_dir, checkpoint_folder)
-        if self.args.global_rank == 0:
+        tmp_dir = None
+
+        if output_dir.startswith("oss://"):
+            tmp_dir = oss.TemporaryDirectory(oss_path=output_dir, mode="upload")
+            output_dir = tmp_dir.name
+        elif self.args.global_rank == 0:
             os.makedirs(output_dir, exist_ok=True)
         torch.distributed.barrier()
 
         self._save_model(output_dir, full=False)
-        self._save_optimizer_and_scheduler(output_dir)
+        self._save_optimizer_and_scheduler(output_dir, is_tmp_dir=tmp_dir is not None)
         self._save_rng_state(output_dir)
 
         # Save the Trainer state
@@ -531,14 +821,44 @@ class Trainer(object):
                     self.state.stateful_callbacks[cb_name] = cb_state
             self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
 
-        # Maybe delete some older checkpoints.
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
+
         if self.args.global_rank == 0:
-            # we use mtime as default, filesystems without mtime support will be detected in `_sorted_checkpoints`
-            self._rotate_checkpoints(use_mtime=True, output_dir=self.args.output_dir)
+            rotate_checkpoints(
+                output_dir=self.args.output_dir,
+                save_total_limit=self.args.save_total_limit,
+            )
+
+        torch.distributed.barrier()
 
     def _load_checkpoint(self, checkpoint: Optional[str]):
         self._load_optimizer_and_scheduler(checkpoint)
         self._load_model(checkpoint)
+
+    def _save_full_model(self):
+        if self.args.save_full_model:
+            if self._is_zero3():
+                with GatheredParameters(self.model.parameters()):
+                    if self.args.global_rank == 0:
+                        kwargs = {}
+                        if "convert" in inspect.signature(self.model.state_dict).parameters:
+                            kwargs["convert"] = False
+                        state_dict = self.model.state_dict(**kwargs)
+                    else:
+                        state_dict = None
+            else:
+                state_dict = gather_ep_params(self.model)
+                state_dict = gather_pp_params(state_dict)
+        else:
+            state_dict = None
+        if self.args.global_rank == 0:
+            if state_dict is not None:
+                self.model.save_pretrained(self.args.output_dir, state_dict=state_dict)
+            else:
+                self.model.config.save_pretrained(self.args.output_dir)
+            self.processing_class.save_pretrained(self.args.output_dir)
+        torch.distributed.barrier()
 
     def log(self, logs: dict[str, float]) -> None:
         if self.state.epoch is not None:
@@ -548,14 +868,14 @@ class Trainer(object):
                 self.state.num_input_tokens_seen, dtype=torch.float32, device=self.args.device
             )
             torch.distributed.all_reduce(
-                num_tokens_tensor, op=torch.distributed.ReduceOp.AVG, group=self.args.dp_group
+                num_tokens_tensor, op=torch.distributed.ReduceOp.AVG, group=self.args.dcp_group
             )
             self.state.num_input_tokens_seen = num_tokens_tensor.item()
             logs["num_tokens_seen"] = self.state.num_input_tokens_seen * self.args.dp_world_size
             logs["throughput"] = self.state.num_input_tokens_seen / self.state.running_time
         if self.args.log_flops:
             flops_tensor = torch.tensor(self.state.total_flos, dtype=torch.float32, device=self.args.device)
-            torch.distributed.all_reduce(flops_tensor, op=torch.distributed.ReduceOp.AVG, group=self.args.dp_group)
+            torch.distributed.all_reduce(flops_tensor, op=torch.distributed.ReduceOp.AVG, group=self.args.dcp_group)
             self.state.total_flos = flops_tensor.item()
             logs["tflops"] = self.state.total_flos / self.state.running_time
 
@@ -571,7 +891,7 @@ class Trainer(object):
             torch.distributed.all_reduce(
                 tr_loss,
                 op=torch.distributed.ReduceOp.AVG,
-                group=self.args.dp_group,
+                group=self.args.dcp_group,
             )
             tr_loss_scalar = tr_loss.item()
 
@@ -681,17 +1001,15 @@ class Trainer(object):
         # Activate gradient checkpointing if needed
         if args.gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
+            encoder = self.model.get_encoder(modality="image")
+            if args.encoder_gradient_checkpointing_interval is not None and encoder is not None and hasattr(encoder, "gradient_checkpointing_interval"):
+                encoder.gradient_checkpointing_disable()
+                encoder.gradient_checkpointing_interval = args.encoder_gradient_checkpointing_interval
 
         self.model.train()
 
         if self.args.pp_world_size > 1:
-            module = PipelineModule(
-                self.model,
-                pipeline_model_parallel_size=args.pp_world_size,
-                pipeline_model_parallel_rank=args.pp_rank,
-                data_parallel_size=args.dp_world_size,
-                data_parallel_rank=args.dp_rank,
-            )
+            module = PipelineModule(self.model)
             mpu = module.mpu()
         else:
             module = self.model
@@ -742,14 +1060,26 @@ class Trainer(object):
         steps_trained_in_current_epoch = 0
 
         # Check if continuing training from a checkpoint
-        if resume_from_checkpoint is not None and os.path.isfile(
-            os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
-        ):
-            self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
+        if resume_from_checkpoint is not None:
+            if resume_from_checkpoint.startswith("oss://"):
+                tmp_dir = oss.TemporaryDirectory(
+                    oss_path=resume_from_checkpoint,
+                    mode="download",
+                    include=[TRAINER_STATE_NAME],
+                )
+                trainer_state_path = os.path.join(tmp_dir.name, TRAINER_STATE_NAME)
+            else:
+                tmp_dir = None
+                trainer_state_path = os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
+
+            self.state = TrainerState.load_from_json(trainer_state_path)
             self.compare_trainer_and_checkpoint_args(self.args, self.state)
             self._load_callback_state()
-            epochs_trained = int(self.state.global_step // num_update_steps_per_epoch)
 
+            if tmp_dir is not None:
+                tmp_dir.cleanup()
+
+            epochs_trained = int(self.state.global_step // num_update_steps_per_epoch)
             steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
             steps_trained_in_current_epoch *= args.gradient_accumulation_steps
 
@@ -772,6 +1102,7 @@ class Trainer(object):
         tr_loss = torch.tensor(0.0, device=args.device)
         # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
         self._total_loss_scalar = 0.0
+        self._total_grad_norm_scaler = 0.0
         self._globalstep_last_logged = self.state.global_step
         model.zero_grad()
         grad_norm: Optional[float] = None
@@ -822,36 +1153,12 @@ class Trainer(object):
                 update_step += 1
 
                 num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
-                batch_samples = self.get_batch_samples(epoch_iterator, num_batches, args.device)
+                batch_samples = LazyBatchLoader(
+                    epoch_iterator=epoch_iterator,
+                    num_batches=num_batches,
+                    training_args=args,
+                )
                 step += num_batches
-
-                for inputs in batch_samples:
-                    if args.log_seen_tokens:
-                        main_input_name = getattr(self.model, "main_input_name", "input_ids")
-                        if main_input_name not in inputs:
-                            logger.warning(
-                                "Tried to track the number of tokens seen, however the current model is "
-                                "not configured properly to know what item is the input. To fix this, add "
-                                "a `main_input_name` attribute to the model class you are using."
-                            )
-                        else:
-                            if "attention_mask" in inputs:
-                                input_tokens = inputs["attention_mask"].sum()
-                            elif (
-                                self.processing_class is not None
-                                and hasattr(self.processing_class, "pad_token_id")
-                                and self.processing_class.pad_token_id is not None
-                            ):
-                                input_tokens = (inputs[main_input_name] != self.processing_class.pad_token_id).sum()
-                            else:
-                                input_tokens = inputs[main_input_name].numel()
-
-                            self.state.num_input_tokens_seen += input_tokens
-
-                    if args.log_flops and args.pp_rank == 0:
-                        self.state.total_flos += (
-                            float(self.model.floating_point_ops(inputs)) / args.pp_world_size / 1e12 * 3
-                        )
 
                 if rng_to_sync:
                     self._load_rng_state(resume_from_checkpoint)
@@ -859,19 +1166,58 @@ class Trainer(object):
 
                 self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
                 losses = pipeline_schedule.step(batch_samples)
-
                 tr_loss = tr_loss + losses.mean()
+
+                if args.pp_rank == 0:
+                    for inputs in batch_samples:
+                        if args.log_seen_tokens:
+                            main_input_name = getattr(self.model, "main_input_name", "input_ids")
+                            if main_input_name not in inputs:
+                                logger.warning(
+                                    "Tried to track the number of tokens seen, however the current model is "
+                                    "not configured properly to know what item is the input. To fix this, add "
+                                    "a `main_input_name` attribute to the model class you are using."
+                                )
+                            else:
+                                if "attention_mask" in inputs:
+                                    input_tokens = inputs["attention_mask"].sum()
+                                elif (
+                                    self.processing_class is not None
+                                    and hasattr(self.processing_class, "pad_token_id")
+                                    and self.processing_class.pad_token_id is not None
+                                ):
+                                    input_tokens = (inputs[main_input_name] != self.processing_class.pad_token_id).sum()
+                                else:
+                                    input_tokens = inputs[main_input_name].numel()
+
+                                self.state.num_input_tokens_seen += input_tokens
+
+                        if args.log_flops:
+                            self.state.total_flos += (
+                                float(self.model.floating_point_ops(inputs)) / 1e12 * 3
+                            )
+
+                if self.args.cleanup_before_optimizer_step:
+                    del batch_samples
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
                 self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
                 with torch.cuda.nvtx.range("optimizer_step"):
-                    self.deepspeed_engine.step()
+                    if self.args.pp_world_size > 1:
+                        self.optimizer.step()
+                    else:
+                        self.deepspeed_engine.step()
                 self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
 
                 if args.max_grad_norm is not None and args.max_grad_norm > 0:
                     grad_norm = self.deepspeed_engine.get_global_grad_norm()
+                    if grad_norm is None and hasattr(self.optimizer, '_global_grad_norm'):
+                        grad_norm = self.optimizer._global_grad_norm
                     # In some cases the grad norm may not return a float
                     if hasattr(grad_norm, "item"):
                         grad_norm = grad_norm.item()
+                    self._total_grad_norm_scaler += grad_norm
 
                 # get leaning rate before update
                 learning_rate = self._get_learning_rate()
@@ -881,7 +1227,7 @@ class Trainer(object):
                     if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                         self.lr_scheduler.step()
 
-                model.zero_grad()
+                self.deepspeed_engine.zero_grad()
 
                 self.state.global_step += 1
                 self.state.epoch = epoch + (step + 1) / steps_in_epoch
@@ -928,6 +1274,7 @@ class Trainer(object):
             num_tokens=self.state.num_input_tokens_seen,
         )
         metrics["train_loss"] = train_loss
+        metrics["grad_norm"] = self._total_grad_norm_scaler / effective_global_step
 
         self.is_in_train = False
 
@@ -936,6 +1283,9 @@ class Trainer(object):
         self.log(metrics)
 
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
+
+        if self.control.should_save:
+            self._save_full_model()
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
 

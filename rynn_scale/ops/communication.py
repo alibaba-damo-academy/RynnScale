@@ -1,7 +1,6 @@
-from typing import Optional, List
+from typing import List, Optional
 
 import torch
-
 
 __all__ = ["all_to_all"]
 

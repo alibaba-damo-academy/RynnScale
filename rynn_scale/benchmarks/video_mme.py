@@ -2,8 +2,8 @@ import os
 import re
 from copy import deepcopy
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 @BENCHMARK_REGISTRY.register()

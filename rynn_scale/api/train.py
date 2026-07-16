@@ -1,29 +1,39 @@
-import pathlib
+import os
 import re
 from functools import partial
 
 from transformers import HfArgumentParser
 from transformers.trainer_utils import enable_full_determinism, set_seed
 
+from ..arguments import TrainingArguments
+from ..datasets import build_dataset
+from ..models import build_model, init_weights
+from ..ops import cross_entropy_loss
+from ..projects import register_projects
 from ..training import (
     DataCollator,
     Trainer,
 )
-from ..arguments import TrainingArguments
-from ..datasets import build_dataset
-from ..models import build_model
-from ..ops import cross_entropy_loss
-from ..utils import logging
-
+from ..utils import logging, oss
 
 logger = logging.get_logger(__name__)
 
 
 def train():
+    register_projects()
+
     parser = HfArgumentParser(TrainingArguments)
     args = parser.parse_args_into_dataclasses()[0]
 
     enable_full_determinism(args.seed) if args.full_determinism else set_seed(args.seed)
+
+    if args.output_dir.startswith("oss://"):
+        contents = oss.listdir(args.output_dir)
+    elif os.path.exists(args.output_dir):
+        contents = os.listdir(args.output_dir)
+    else:
+        contents = []
+    resume_from_checkpoint = any(x.startswith("checkpoint-") for x in contents)
 
     model, processor = build_model(
         model_type=args.model_type,
@@ -32,6 +42,11 @@ def train():
         attn_implementation=args.attn_implementation,
         vision_encoder_path=args.vision_encoder_path,
         reduced_layers_in_stage_zero=args.reduced_layers_in_stage_zero,
+    )
+
+    init_weights(
+        model,
+        pretrained_model_name_or_path=args.model_path if not resume_from_checkpoint else None,
     )
 
     model.loss_function = partial(
@@ -46,9 +61,6 @@ def train():
             if any(re.match(pattern, name) for pattern in args.frozen_parameters):
                 param.requires_grad_(False)
     frozen_params = [name for name, param in model.named_parameters() if not param.requires_grad]
-
-    if args.gradient_checkpointing:
-        assert getattr(model, "supports_selective_gradient_checkpointing", False)
 
     logger.info(
         f"Model config: {model.config}\n\n"
@@ -73,7 +85,6 @@ def train():
         processing_class=processor,
     )
 
-    resume_from_checkpoint = len(list(pathlib.Path(args.output_dir).glob("checkpoint-*"))) > 0
     return trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
 

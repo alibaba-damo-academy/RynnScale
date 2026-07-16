@@ -1,9 +1,9 @@
 import ray
 from transformers import HfArgumentParser
 
-from ..evaluation import Evaluator
 from ..arguments import EvaluationArguments
 from ..benchmarks import build_benchmark
+from ..evaluation import Evaluator
 from ..inference_wrappers import build_inference_wrapper
 
 
@@ -26,8 +26,8 @@ def main():
     benchmarks = [
         build_benchmark(
             benchmark,
-            use_cot=args.use_cot,
             prompt_format=args.prompt_format,
+            enable_thinking=args.enable_thinking,
         )
         for benchmark in args.benchmarks
     ]

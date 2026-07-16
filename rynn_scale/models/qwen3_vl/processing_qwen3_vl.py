@@ -1,148 +1,130 @@
 import math
-from collections import defaultdict
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional
 
 import torch
 import transformers
-from transformers.models.qwen3_vl.video_processing_qwen3_vl import smart_resize
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
 from transformers.models.qwen3_vl.processing_qwen3_vl import (
-    Qwen3VLProcessor as _Qwen3VLProcessor,
+    Qwen3VLProcessor,
     Qwen3VLProcessorKwargs,
 )
-from transformers.processing_utils import AllKwargsForChatTemplate, Unpack, BatchFeature, MultiModalData
+from transformers.models.qwen3_vl.video_processing_qwen3_vl import smart_resize
+from transformers.processing_utils import AllKwargsForChatTemplate, MultiModalData, Unpack
 
 from ...utils.processing import load_multimodal_data
 
 
-class Qwen3VLProcessor(_Qwen3VLProcessor):
+class _Qwen3VLProcessor(Qwen3VLProcessor):
     def apply_chat_template(
         self,
         conversation: List[Dict[str, str]],
         chat_template: Optional[str] = None,
+        fps: Optional[int] = None,
+        max_frames: Optional[int] = None,
         mm_max_length: Optional[int] = None,
         return_labels: bool = False,
         **kwargs: Unpack[AllKwargsForChatTemplate],
     ):
-        if return_labels:
-            assert kwargs.get("return_tensors", None) == "pt", (
-                "`return_tensors` must be set to `pt` when `return_labels` is True."
+        if mm_max_length is not None:
+            assert "max_pixels" not in kwargs and "size" not in kwargs, (
+                "Please provide only one of `mm_max_length` and `max_pixels`."
             )
-            assert not kwargs.get("add_generation_prompt", False), (
-                "`add_generation_prompt` must be set to False when `return_labels` is True."
-            )
-            assert kwargs.get("tokenize", True), "`tokenize` must be set to True when `return_labels` is True."
-            assert kwargs.get("return_dict", False), "`return_dict` must be set to True when `return_labels` is True."
+            num_images, num_videos = 0, 0
+            for message in conversation:
+                for content in message["content"]:
+                    if content["type"] == "image":
+                        num_images += 1
+                    elif content["type"] == "video":
+                        num_videos += 1
+            kwargs["size"] = {
+                # FIXME: add an argument to control `shortest_edge`
+                "shortest_edge": self.image_processor.size["shortest_edge"],
+                "longest_edge": self._get_max_pixels(
+                    num_images=num_images,
+                    num_videos=num_videos,
+                    mm_max_length=mm_max_length,
+                ),
+            }
 
-            pseudo_message = [{"role": "user", "content": [{"type": "text", "text": ""}]}]
-            prompt_tokens = super().apply_chat_template(
-                pseudo_message, chat_template=chat_template, tokenize=True, add_generation_prompt=False
-            )[0]
-            conv_tokens = super().apply_chat_template(
-                pseudo_message, chat_template=chat_template, tokenize=True, add_generation_prompt=True
-            )[0]
-            prompt_length = len(conv_tokens) - len(prompt_tokens)
-
-            ignore_tokens = torch.as_tensor(
-                [self.image_token_id, self.video_token_id, self.vision_start_token_id, self.vision_end_token_id]
-            )[None, None]
-
-        fps = kwargs.pop("fps", 1)
-        max_frames = kwargs.pop("max_frames", None)
-        tokenize = kwargs.pop("tokenize", True)
-        return_dict = kwargs.pop("return_dict", False)
-        return_tensors = kwargs.pop("return_tensors", None)
-        add_generation_prompt = kwargs.pop("add_generation_prompt", False)
-        kwargs.pop("do_sample_frames", False)
-
-        if tokenize and return_dict:
-            conversation = load_multimodal_data(
+        if not return_labels:
+            return super().apply_chat_template(
                 conversation,
-                fps=fps,
-                max_frames=max_frames,
-            )
-
-            if mm_max_length is not None:
-                assert "max_pixels" not in kwargs and "size" not in kwargs, (
-                    "Please provide only one of `mm_max_length` and `max_pixels`."
-                )
-                num_images, num_videos = 0, 0
-                for message in conversation:
-                    for content in message["content"]:
-                        if content["type"] == "image":
-                            num_images += 1
-                        elif content["type"] == "video":
-                            num_videos += 1
-                kwargs["size"] = {
-                    # FIXME: add an argument to control `shortest_edge`
-                    "shortest_edge": self.image_processor.size["shortest_edge"],
-                    "longest_edge": self._get_max_pixels(
-                        num_images=num_images,
-                        num_videos=num_videos,
-                        mm_max_length=mm_max_length,
-                    ),
-                }
-
-        outputs = defaultdict(list)
-
-        for i, message in enumerate(conversation):
-            prompt = super().apply_chat_template(
-                [message],
                 chat_template=chat_template,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt and i == len(conversation) - 1,
+                **kwargs,
             )
 
-            if tokenize and return_dict:
-                images, videos, video_metadatas = [], [], []
-                if message["role"] != "assistant":
-                    for content in message["content"]:
-                        if content["type"] == "image":
-                            images.append(content["image"])
-                        elif content["type"] == "video":
-                            videos.append(content["video"][0])
-                            video_metadatas.append(content["video"][1])
+        assert kwargs.pop("return_tensors", None) == "pt", (
+            "`return_tensors` must be set to `pt` when `return_labels` is True."
+        )
+        assert not kwargs.pop("add_generation_prompt", False), (
+            "`add_generation_prompt` must be set to False when `return_labels` is True."
+        )
+        assert kwargs.pop("tokenize", True), "`tokenize` must be set to True when `return_labels` is True."
+        assert kwargs.pop("return_dict", False), "`return_dict` must be set to True when `return_labels` is True."
+        assert kwargs.pop("do_sample_frames", True), "`do_sample_frames` must be set to True when `return_labels` is True."
 
-                results = self(
-                    text=prompt,
-                    images=images if len(images) > 0 else None,
-                    videos=videos if len(videos) > 0 else None,
-                    video_metadata=video_metadatas if len(videos) > 0 else None,
-                    return_tensors="pt",
-                    do_sample_frames=False,
-                    **kwargs,
-                )
+        prompt = super().apply_chat_template(
+            conversation,
+            chat_template=chat_template,
+            add_generation_prompt=False,
+            tokenize=False,
+            **kwargs,
+        )
 
-                if return_labels:
-                    labels = torch.full_like(results["input_ids"], fill_value=-100, dtype=torch.long)
-                    if message["role"] == "assistant":
-                        valid_mask = torch.all(results["input_ids"][..., None] != ignore_tokens, dim=-1)
-                        # prefix: <|im_start|>assistant\n
-                        valid_mask[:, :prompt_length] = False
-                        # postfix: \n
-                        valid_mask[:, -1] = False
-                        labels[valid_mask] = results["input_ids"][valid_mask]
-                    results["labels"] = labels
+        images, videos, video_metadatas = load_multimodal_data(
+            conversation,
+            fps=fps,
+            max_frames=max_frames,
+        )
 
-                for key, value in results.items():
-                    outputs[key].append(value)
+        model_inputs = self(
+            text=prompt,
+            images=images,
+            videos=videos,
+            video_metadata=video_metadatas,
+            do_sample_frames=False,
+            return_tensors="pt",
+            **kwargs,
+        )
 
-            else:
-                outputs["prompts"].append(prompt)
+        start_token_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+        end_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        assistant_token_id = self.tokenizer.convert_tokens_to_ids("assistant")
 
-        if tokenize:
-            mm_input_names = set(self.image_processor.model_input_names + self.video_processor.model_input_names)
-            for k, v in outputs.items():
-                if k in mm_input_names:
-                    outputs[k] = torch.cat(v, dim=0)
-                else:
-                    outputs[k] = torch.cat(v, dim=1)
-            outputs = BatchFeature(outputs, tensor_type=return_tensors)
-            if return_dict:
-                return outputs
-            return outputs["input_ids"]
+        generation_prompts = [
+            self.tokenizer.encode(text, return_tensors="pt")[0]
+            for text in ["<|im_start|>assistant\n<think>\n\n</think>\n\n", "<|im_start|>assistant\n"]
+        ]
 
-        return "".join(outputs["prompts"])
+        batch_labels = []
+        for i in range(len(model_inputs["input_ids"])):
+            input_ids = model_inputs["input_ids"][i]
+            start_indices = torch.nonzero(input_ids == start_token_id).squeeze(-1)
+            end_indices = torch.nonzero(input_ids == end_token_id).squeeze(-1)
+            assert start_indices.size(0) == end_indices.size(0)
+
+            roles = input_ids[start_indices + 1]
+            is_assistant_msg = roles == assistant_token_id
+            assert is_assistant_msg.any()
+
+            labels = torch.full_like(input_ids, fill_value=-100)
+            for msg_idx in range(len(start_indices)):
+                if is_assistant_msg[msg_idx]:
+                    start_idx, end_idx = start_indices[msg_idx], end_indices[msg_idx]
+                    for generation_prompt in generation_prompts:
+                        prefix = input_ids[start_idx : start_idx + generation_prompt.size(0)]
+                        if prefix.size(-1) == generation_prompt.size(-1) and torch.all(prefix == generation_prompt):
+                            start_idx = start_idx + generation_prompt.size(0)
+                            break
+                    else:
+                        raise ValueError("No generation prompt found in assistant message.")
+                    labels[start_idx:end_idx + 1] = input_ids[start_idx:end_idx + 1]
+
+            batch_labels.append(labels)
+
+        model_inputs["labels"] = torch.stack(batch_labels, dim=0)
+
+        return model_inputs
 
     def _get_max_pixels(
         self,
@@ -232,5 +214,5 @@ class Qwen3VLProcessor(_Qwen3VLProcessor):
 
 
 def apply_monkey_patch():
-    transformers.models.qwen3_vl.processing_qwen3_vl.Qwen3VLProcessor = Qwen3VLProcessor
-    transformers.models.auto.processing_auto.PROCESSOR_MAPPING[Qwen3VLConfig] = Qwen3VLProcessor
+    transformers.models.qwen3_vl.processing_qwen3_vl.Qwen3VLProcessor = _Qwen3VLProcessor
+    transformers.models.auto.processing_auto.PROCESSOR_MAPPING[Qwen3VLConfig] = _Qwen3VLProcessor

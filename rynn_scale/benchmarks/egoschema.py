@@ -1,10 +1,11 @@
 import json
 import os
 import re
+
 import requests
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 @BENCHMARK_REGISTRY.register()

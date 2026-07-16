@@ -1,4 +1,5 @@
 import os
+import subprocess
 from setuptools import setup
 
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
@@ -37,9 +38,16 @@ ext_modules = [
 ]
 
 
+try:
+    cmd = ["git", "rev-parse", "--short", "HEAD"]
+    revision = "+" + subprocess.check_output(cmd).decode("ascii").rstrip()
+except Exception as _:
+    revision = ""
+
+
 setup(
     name="rynn_scale",
-    version="0.1.0",
+    version="0.1.0" + revision,
     description="",
     packages=["rynn_scale"],
     ext_modules=ext_modules,

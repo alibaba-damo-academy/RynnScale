@@ -1,7 +1,7 @@
 from transformers import PretrainedConfig, ProcessorMixin
 
-from . import vlm_datasets
 from ..registry import DATASET_REGISTRY
+from . import vlm_datasets
 
 
 def build_dataset(args, model_config: PretrainedConfig, processor: ProcessorMixin):
@@ -15,9 +15,6 @@ def build_dataset(args, model_config: PretrainedConfig, processor: ProcessorMixi
             mm_max_length=args.mm_max_length,
             fps=args.fps,
             max_frames=args.max_frames,
-            dataloader_num_workers=args.dataloader_num_workers,
-            output_dir=args.output_dir,
             seed=args.seed,
-            requires_length=args.dynamic_batching or args.decoder_load_balancing,
         )
     raise NotImplementedError

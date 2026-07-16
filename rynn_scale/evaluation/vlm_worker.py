@@ -5,8 +5,8 @@ import ray
 import torch
 import torch.multiprocessing as mp
 import zmq
-from ray.util.queue import Queue, Empty
-from torch.utils.data import IterableDataset, DataLoader
+from ray.util.queue import Empty, Queue
+from torch.utils.data import DataLoader, IterableDataset
 
 from ..inference_wrappers import BaseInferenceWrapper
 
@@ -24,7 +24,7 @@ class ProcessorWorker(IterableDataset):
         self.processing_params = processing_params
         self.input_queue = input_queue
 
-    def _process_hf(self, data):
+    def _preprocess(self, data):
         enable_thinking = data.pop("enable_thinking", False)
         image_inputs, video_inputs = {}, {}
 
@@ -58,6 +58,20 @@ class ProcessorWorker(IterableDataset):
                 video_inputs=video_inputs,
             )
 
+            if self.backend == "sglang":
+                image_data, video_data = {"format": "processor_output"}, {"format": "processor_output"}
+                for name, value in model_inputs.items():
+                    if name in self.inference_wrapper.processor.image_processor.model_input_names:
+                        image_data[name] = value
+                    if name in self.inference_wrapper.processor.video_processor.model_input_names:
+                        video_data[name] = value
+
+                model_inputs = {
+                    "input_ids": model_inputs["input_ids"][0].tolist(),
+                    "image_data": image_data if len(image_data) > 1 else None,
+                    "video_data": video_data if len(video_data) > 1 else None,
+                }
+
             request = {
                 "benchmark": data["benchmark"],
                 "data_id": data_id,
@@ -65,52 +79,21 @@ class ProcessorWorker(IterableDataset):
             }
             yield request
 
-    def _process_sglang(self, data):
-        enable_thinking = data.pop("enable_thinking", False)
-        for data_id, conversation in zip(data["data_ids"], data["conversations"]):
-            prompt = self.inference_wrapper.apply_chat_template(conversation, enable_thinking=enable_thinking)
-
-            images, videos = [], []
-            for message in conversation:
-                for content in message["content"]:
-                    if content["type"] == "image":
-                        images.append(content["image"])
-                    elif content["type"] == "video":
-                        videos.append(content["video"])
-
-            request = {
-                "benchmark": data["benchmark"],
-                "data_id": data_id,
-                "model_inputs": {
-                    "prompt": prompt,
-                    "image_data": images if len(images) else None,
-                    "video_data": videos if len(videos) else None,
-                },
-            }
-            yield request
-
     def __iter__(self):
-        if self.backend == "hf":
-            process_fn = self._process_hf
-        elif self.backend == "sglang":
-            process_fn = self._process_sglang
-        else:
-            raise ValueError
-
         while True:
             data = self.input_queue.get()
             if data is None:
                 self.input_queue.put(data)
                 break
-            yield from process_fn(data)
+            yield from self._preprocess(data)
 
 
 class HFModelRunner(object):
     def __init__(
         self,
         inference_wrapper: BaseInferenceWrapper,
-        processing_params: Dict[str, Any],
         sampling_params: Dict[str, Any],
+        parallel_params: Dict[str, Any],
         data_loader: DataLoader,
         output_queue: mp.Queue,
     ):
@@ -141,8 +124,8 @@ class SGLangModelRunner(object):
     def __init__(
         self,
         inference_wrapper: BaseInferenceWrapper,
-        processing_params: Dict[str, Any],
         sampling_params: Dict[str, Any],
+        parallel_params: Dict[str, Any],
         data_loader: DataLoader,
         output_queue: mp.Queue,
     ):
@@ -151,16 +134,7 @@ class SGLangModelRunner(object):
         self.engine = sgl.Engine(
             model_path=inference_wrapper.model_path,
             mem_fraction_static=0.8,
-            # mm_process_config={
-            #     "image": {
-            #         "max_pixels": processing_params.get("image_max_pixels"),
-            #     },
-            #     "video": {
-            #         "fps": processing_params.get("fps"),
-            #         "max_frames": processing_params.get("max_frames"),
-            #         "total_pixels": processing_params.get("video_max_pixels"),
-            #     },
-            # },
+            **parallel_params,
         )
 
         self.sampling_params = sampling_params
@@ -180,9 +154,15 @@ class SGLangModelRunner(object):
 
     async def _main_loop(self):
         running_tasks = set()
+        sem = asyncio.Semaphore(32)
+
+        def callback(task):
+            running_tasks.discard(task)
+            sem.release()
 
         while True:
             try:
+                await sem.acquire()
                 data = await asyncio.to_thread(next, self.data_iterator, None)
 
                 if data is None:
@@ -190,7 +170,7 @@ class SGLangModelRunner(object):
 
                 task = asyncio.create_task(self._process_request(data))
                 running_tasks.add(task)
-                task.add_done_callback(running_tasks.discard)
+                task.add_done_callback(callback)
 
             except Empty:
                 pass
@@ -213,6 +193,7 @@ def start_model_runner(
     inference_wrapper: BaseInferenceWrapper,
     processing_params: Dict[str, Any],
     sampling_params: Dict[str, Any],
+    parallel_params: Dict[str, Any],
     num_processor_workers: int,
     input_queue: mp.Queue,
     output_queue: mp.Queue,
@@ -241,14 +222,14 @@ def start_model_runner(
 
     runner_class(
         inference_wrapper=inference_wrapper,
-        processing_params=processing_params,
         sampling_params=sampling_params,
+        parallel_params=parallel_params,
         data_loader=data_loader,
         output_queue=output_queue,
     ).start()
 
 
-@ray.remote(num_gpus=1)
+@ray.remote
 class VLMWorker(object):
     def __init__(
         self,
@@ -256,6 +237,7 @@ class VLMWorker(object):
         inference_wrapper: BaseInferenceWrapper,
         processing_params: Dict[str, Any],
         sampling_params: Dict[str, Any],
+        parallel_params: Dict[str, Any],
         num_processor_workers: int,
         input_queue: Queue,
         output_queue: Queue,
@@ -264,6 +246,7 @@ class VLMWorker(object):
         self.inference_wrapper = inference_wrapper
         self.processing_params = processing_params
         self.sampling_params = sampling_params
+        self.parallel_params = parallel_params
         self.num_processor_workers = num_processor_workers
         self.input_queue = input_queue
         self.output_queue = output_queue
@@ -299,6 +282,7 @@ class VLMWorker(object):
                 self.inference_wrapper,
                 self.processing_params,
                 self.sampling_params,
+                self.parallel_params,
                 self.num_processor_workers,
                 processor_input_queue,
                 inner_output_queue,

@@ -2,11 +2,11 @@ import json
 import os
 import re
 
-from PIL import Image
 import numpy as np
+from PIL import Image
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 def resample_points(points, target_length):

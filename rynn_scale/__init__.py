@@ -1,1 +1,1 @@
-from . import benchmarks, datasets, models, inference_wrappers
+from . import benchmarks, datasets, inference_wrappers, models

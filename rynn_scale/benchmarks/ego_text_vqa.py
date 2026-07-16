@@ -1,8 +1,8 @@
 import json
 import os
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 @BENCHMARK_REGISTRY.register()
@@ -91,7 +91,7 @@ class EgoTextVQAIndoor(BaseBenchmark):
                 model="gpt-4o-mini-0718-global",  # Use the correct IDEALAB model name
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
                 temperature=0.0,
-                max_tokens=50,
+                max_completion_tokens=100,
             )
 
             response_text = response.choices[0].message.content.strip()

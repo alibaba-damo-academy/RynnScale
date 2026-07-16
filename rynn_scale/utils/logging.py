@@ -1,12 +1,12 @@
+import logging
 import os
 import sys
-import logging
 import threading
 from enum import Enum
 from typing import Optional
 
+import torch
 import transformers
-
 
 _lock = threading.Lock()
 _default_handler: Optional[logging.Handler] = None
@@ -41,9 +41,17 @@ class ColoredMessageFormatter(logging.Formatter):
         logging.CRITICAL: _RED,
     }
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._rank = None
+
     def format(self, record):
-        color = self.LEVEL_COLORS.get(record.levelno, _RESET)
-        format_str = f"{color}%(asctime)s-%(name)s-%(levelname)s:{_RESET} %(message)s"
+        prefix = self.LEVEL_COLORS.get(record.levelno, _RESET)
+        if self._rank is None and torch.distributed.is_initialized():
+            self._rank = torch.distributed.get_rank()
+        if self._rank is not None:
+            prefix += f"[rank{self._rank}] "
+        format_str = f"{prefix}%(asctime)s-%(name)s-%(levelname)s:{_RESET} %(message)s"
         formatter = logging.Formatter(format_str, datefmt="%H:%M:%S")
         return formatter.format(record)
 
@@ -88,8 +96,5 @@ def set_verbosity(verbosity: LogLevel) -> None:
 
 
 def get_logger(name: str) -> logging.Logger:
-    if name is None:
-        name = _get_library_name()
-
     _configure_library_root_logger()
     return logging.getLogger(name)

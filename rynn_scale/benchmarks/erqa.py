@@ -1,9 +1,9 @@
+import json
 import os
 import re
-import json
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 @BENCHMARK_REGISTRY.register()
@@ -31,12 +31,26 @@ class ERQA(BaseBenchmark):
 
     def generate_instruction(self, data_id):
         meta_data = self.data_dict[data_id]
+
+        question = meta_data["question"]
+        if self.enable_thinking:
+            question = question.replace(
+                "Answer with the option letter from the given choices directly.",
+                # "",
+                # "Provide the step by step reasoning and then answer with the option letter from the given choices directly.",
+                # "Provide the step by step reasoning process.",
+                "Solve this multiple-choice question by step-by-step reasoning first.",
+            )
+
         contents = [{"type": "image", "image": image} for image in meta_data["images"]]
-        contents.append({"type": "text", "text": meta_data["question"]})
+        contents.append({"type": "text", "text": question})
         instruction = [{"role": "user", "content": contents}]
+
         return instruction
 
     async def process_response(self, data_id, response):
+        if self.enable_thinking:
+            response = response.split("</think>")[-1]
         matches = re.findall(r"[\(\ ]*[A-D][\)\ ]*", response)
         if not matches:
             options = self.data_dict[data_id]["options"]
@@ -47,7 +61,7 @@ class ERQA(BaseBenchmark):
             else:
                 prediction = None
         else:
-            prediction = matches[0]
+            prediction = matches[0].strip()
         return prediction
 
     async def get_matching_score(self, data_id, prediction):

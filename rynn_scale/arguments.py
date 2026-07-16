@@ -1,22 +1,22 @@
+import json
 import math
 import os
 from dataclasses import dataclass, field, fields
+from datetime import timedelta
 from enum import Enum
-from packaging import version
-from typing import Any, List, Optional, Union, Dict
+from typing import Any, Dict, List, Optional, Union
 
 import deepspeed
-import json
 import torch
+from packaging import version
 from transformers import AutoConfig
-from transformers.training_args import SchedulerType, OptimizerNames
 from transformers.trainer_utils import IntervalStrategy, SaveStrategy
+from transformers.training_args import OptimizerNames, SchedulerType
 
 from . import parallel_state as mpu
-from .utils import logging
 from .registry import DATASET_REGISTRY
+from .utils import logging, oss
 from .utils.pipeline_parallel import PipelineSchedule
-
 
 logger = logging.get_logger(__name__)
 
@@ -55,7 +55,10 @@ class ModelArguments(BaseArguments):
         assert self.model_path is not None
 
         if self.model_type is None:
-            config = AutoConfig.from_pretrained(self.model_path)
+            if self.model_path.startswith("oss://"):
+                config = oss.load_config(self.model_path)
+            else:
+                config = AutoConfig.from_pretrained(self.model_path)
             self.model_type = config.model_type
 
         if self.bf16:
@@ -76,16 +79,28 @@ class ParallelismArguments(BaseArguments):
 
     expert_parallel_size: int = field(default=1)
 
+    context_parallel_size: int = field(default=1)
     encoder_context_parallel_size: int = field(default=1)
+
+    pp_broadcast_data: bool = field(default=False)
+    cp_broadcast_data: bool = field(default=False)
+
+    ddp_timeout: int = field(default=7200)
 
     def __post_init__(self):
         super().__post_init__()
 
         self.local_rank = int(os.environ.get("LOCAL_RANK"))
         torch.cuda.set_device(self.local_rank)
-        self.device = torch.device("cuda")
+        self.device = torch.device("cuda", self.local_rank)
 
-        torch.distributed.init_process_group(backend="nccl", device_id=self.local_rank)
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend="nccl",
+                device_id=self.device,
+                timeout=timedelta(seconds=self.ddp_timeout),
+            )
+
         deepspeed.init_distributed(dist_backend="nccl")
 
         self.global_world_size = torch.distributed.get_world_size()
@@ -93,6 +108,7 @@ class ParallelismArguments(BaseArguments):
 
         assert 1 <= self.pipeline_parallel_size <= torch.distributed.get_world_size()
         assert 1 <= self.expert_parallel_size <= torch.distributed.get_world_size()
+        assert 1 <= self.context_parallel_size <= torch.distributed.get_world_size()
         assert 1 <= self.encoder_context_parallel_size <= torch.distributed.get_world_size()
         assert self.reduced_layers_in_stage_zero >= 0
 
@@ -106,12 +122,21 @@ class ParallelismArguments(BaseArguments):
         mpu.initialize_model_parallel(
             pipeline_model_parallel_size=self.pipeline_parallel_size,
             expert_model_parallel_size=self.expert_parallel_size,
+            context_parallel_size=self.context_parallel_size,
             encoder_context_parallel_size=self.encoder_context_parallel_size,
         )
 
         self.dp_group = mpu.get_data_parallel_group()
-        self.dp_world_size = torch.distributed.get_world_size(self.dp_group)
-        self.dp_rank = torch.distributed.get_rank(self.dp_group)
+        self.dp_world_size = mpu.get_data_parallel_world_size()
+        self.dp_rank = mpu.get_data_parallel_rank()
+
+        self.dcp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        self.dcp_world_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+        self.dcp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+
+        self.cp_group = mpu.get_context_parallel_group()
+        self.cp_world_size = mpu.get_context_parallel_world_size()
+        self.cp_rank = mpu.get_context_parallel_rank()
 
         self.pp_group = mpu.get_pipeline_model_parallel_group()
         self.pp_world_size = mpu.get_pipeline_model_parallel_world_size()
@@ -128,7 +153,7 @@ class ParallelismArguments(BaseArguments):
 
 @dataclass
 class DataArguments(BaseArguments):
-    data_type: str = field(default=None, metadata={"choices": DATASET_REGISTRY.keys()})
+    data_type: str = field(default=None)
     data_path: List[str] = field(default=None)
     data_mixture: Optional[str] = field(default=None)
 
@@ -157,6 +182,7 @@ class DataArguments(BaseArguments):
 
         else:
             assert self.data_type is not None
+            assert self.data_type in DATASET_REGISTRY, f"Available data types: {DATASET_REGISTRY.keys()}"
 
 
 @dataclass
@@ -171,7 +197,7 @@ class TrainingArguments(ModelArguments, ParallelismArguments, DataArguments, Bas
             "help": "Gradient checkpointing key word arguments such as `use_reentrant`. Will be passed to `torch.utils.checkpoint.checkpoint` through `model.gradient_checkpointing_enable`."
         },
     )
-    selective_gradient_checkpointing: bool = field(default=False)
+    encoder_gradient_checkpointing_interval: Optional[int] = field(default=None)
 
     sequence_packing: bool = field(default=True)
     decoder_load_balancing: bool = field(default=False)
@@ -264,8 +290,13 @@ class TrainingArguments(ModelArguments, ParallelismArguments, DataArguments, Bas
     )
     save_steps: int = field(default=1000)
     save_total_limit: Optional[int] = field(default=None)
+    save_full_model: bool = field(default=True)
 
     restore_callback_states_from_checkpoint: bool = field(default=False)
+
+    # Misc
+    synchronize_experts_before_forward: bool = field(default=False)
+    cleanup_before_optimizer_step: bool = field(default=False)
 
     # Reproducibility
     seed: int = field(default=42)
@@ -274,8 +305,9 @@ class TrainingArguments(ModelArguments, ParallelismArguments, DataArguments, Bas
     def __post_init__(self):
         super().__post_init__()
 
-        if self.selective_gradient_checkpointing:
+        if self.encoder_gradient_checkpointing_interval is not None:
             assert self.gradient_checkpointing
+            assert self.encoder_gradient_checkpointing_interval > 0
 
         if self.sequence_packing:
             assert "flash_attention" in self.attn_implementation, "Sequence packing requires flash attention."
@@ -314,7 +346,21 @@ class TrainingArguments(ModelArguments, ParallelismArguments, DataArguments, Bas
             deepspeed_config = json.load(f)
         self.deepspeed_config = self._process_deepspeed_config(deepspeed_config)
 
+        zero_stage = self.deepspeed_config.get("zero_optimization", {}).get("stage", 0)
+        if zero_stage == 3:
+            assert self.pipeline_parallel_size == 1, "ZeRO-3 is incompatible with pipeline parallelism."
+            assert self.expert_parallel_size == 1, "ZeRO-3 is incompatible with expert parallelism."
+
+        if self.synchronize_experts_before_forward:
+            assert self.ep_world_size > 1
+
     def _process_deepspeed_config(self, deepspeed_config: Dict[str, Any]):
+        if self.model_path.startswith("oss://"):
+            config = oss.load_config(self.model_path)
+        else:
+            config = AutoConfig.from_pretrained(self.model_path)
+        hidden_size = config.get_text_config().hidden_size
+
         def _process_auto(config, prefix=""):
             config = config.copy()
             for key, value in config.items():
@@ -322,9 +368,7 @@ class TrainingArguments(ModelArguments, ParallelismArguments, DataArguments, Bas
                 if isinstance(value, dict):
                     config[key] = _process_auto(value, prefix=global_key + ".")
                 elif value == "auto":
-                    if global_key == "train_batch_size":
-                        config[key] = self.micro_batch_size * self.gradient_accumulation_steps * self.dp_world_size
-                    elif global_key == "train_micro_batch_size_per_gpu":
+                    if global_key == "train_micro_batch_size_per_gpu":
                         config[key] = self.micro_batch_size
                     elif global_key == "gradient_accumulation_steps":
                         config[key] = self.gradient_accumulation_steps
@@ -334,6 +378,12 @@ class TrainingArguments(ModelArguments, ParallelismArguments, DataArguments, Bas
                         config[key] = self.fp16
                     elif global_key == "bf16.enabled":
                         config[key] = self.bf16
+                    elif global_key == "zero_optimization.reduce_bucket_size":
+                        config[key] = hidden_size * hidden_size
+                    elif global_key == "zero_optimization.stage3_prefetch_bucket_size":
+                        config[key] = int(0.9 * hidden_size * hidden_size)
+                    elif global_key == "zero_optimization.stage3_param_persistence_threshold":
+                        config[key] = 10 * hidden_size
                     else:
                         raise ValueError(f"Unsupported auto config: {key}")
             return config
@@ -350,8 +400,8 @@ class TrainingArguments(ModelArguments, ParallelismArguments, DataArguments, Bas
 @dataclass
 class EvaluationArguments(ModelArguments):
     benchmarks: List[str] = field(default=None)
-    use_cot: bool = field(default=False)
     prompt_format: str = field(default=None)
+    enable_thinking: bool = field(default=False)
     save_dir: str = field(default=None)
 
     backend: str = field(default="hf", metadata={"choices": ["hf", "sglang"]})
@@ -370,6 +420,10 @@ class EvaluationArguments(ModelArguments):
     top_p: float = field(default=0.95)
     top_k: int = field(default=50)
     repetition_penalty: Optional[float] = field(default=None)
+
+    tensor_parallel_size: int = field(default=1)
+    expert_parallel_size: int = field(default=1)
+    pipeline_parallel_size: int = field(default=1)
 
     def __post_init__(self):
         super().__post_init__()
@@ -394,3 +448,13 @@ class EvaluationArguments(ModelArguments):
         }
         if self.repetition_penalty is not None:
             self.sampling_params["repetition_penalty"] = self.repetition_penalty
+
+        if self.backend == "hf":
+            assert self.tensor_parallel_size == 1
+            assert self.expert_parallel_size == 1
+
+        self.parallel_params = {
+            "tp_size": self.tensor_parallel_size,
+            "ep_size": self.expert_parallel_size,
+            "pp_size": self.pipeline_parallel_size,
+        }

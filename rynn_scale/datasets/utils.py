@@ -130,7 +130,7 @@ def get_rope_index(
     input_ids: torch.LongTensor,
     **kwargs,
 ) -> torch.Tensor:
-    if model_config.model_type in ["qwen3_vl", "qwen3_vl_moe"]:
+    if model_config.model_type in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]:
         position_ids = _get_rope_index_qwen3_vl(
             model_config=model_config,
             input_ids=input_ids,

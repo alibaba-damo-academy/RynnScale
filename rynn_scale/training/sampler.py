@@ -2,13 +2,14 @@ import math
 from typing import List
 
 import torch
-from torch.utils.data import DistributedSampler, Dataset
+from torch.utils.data import Dataset, DistributedSampler
 
 
 class DistributedBatchSampler(DistributedSampler):
     def __init__(
         self,
         dataset: Dataset,
+        sequence_lengths: List[int],
         num_replicas: int,
         rank: int,
         micro_batch_size: int,
@@ -22,6 +23,7 @@ class DistributedBatchSampler(DistributedSampler):
         model_max_length: int = 16384,
     ):
         self.dataset = dataset
+        self.sequence_lengths = sequence_lengths
         self.num_replicas = num_replicas
         self.rank = rank
         self.micro_batch_size = micro_batch_size
@@ -35,9 +37,7 @@ class DistributedBatchSampler(DistributedSampler):
         self.epoch = 0
         self.num_skipped_batches = 0
 
-        assert not (decoder_load_balancing or dynamic_batching) or getattr(dataset, "length", None) is not None, (
-            "Dataset must have length attribute."
-        )
+        assert not (decoder_load_balancing or dynamic_batching) or sequence_lengths is not None
 
         if self.dynamic_batching:
             raise NotImplementedError
@@ -98,7 +98,7 @@ class DistributedBatchSampler(DistributedSampler):
         partitions = [[] for _ in range(self.num_replicas)]
         batch_seqlens = [0 for _ in range(self.num_replicas)]
 
-        seqlen_list = [self.dataset.length[i] for i in data_indices]
+        seqlen_list = [self.sequence_lengths[i] for i in data_indices]
         sorted_seqlen_list = sorted(
             [(seqlen, i) for i, seqlen in enumerate(seqlen_list)],
             key=lambda x: x[0],
@@ -123,15 +123,18 @@ class DistributedBatchSampler(DistributedSampler):
             for j in range(self.gradient_accumulation_steps):
                 if i * self.gradient_accumulation_steps + j < self.num_skipped_batches:
                     continue
-                all_sample_indices = sum(
-                    [
-                        global_batch_indices[k][i][j * self.micro_batch_size : (j + 1) * self.micro_batch_size]
-                        for k in range(self.num_replicas)
-                    ],
-                    [],
-                )
-                batch_indices = self._longest_first_partition(all_sample_indices)
-                yield batch_indices[self.rank]
+                if self.decoder_load_balancing:
+                    all_sample_indices = sum(
+                        [
+                            global_batch_indices[k][i][j * self.micro_batch_size : (j + 1) * self.micro_batch_size]
+                            for k in range(self.num_replicas)
+                        ],
+                        [],
+                    )
+                    batch_indices = self._longest_first_partition(all_sample_indices)
+                    yield batch_indices[self.rank]
+                else:
+                    yield global_batch_indices[self.rank][i][j * self.micro_batch_size : (j + 1) * self.micro_batch_size]
 
     def __len__(self) -> int:
         return self.num_batches * self.gradient_accumulation_steps

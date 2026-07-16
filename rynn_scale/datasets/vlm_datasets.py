@@ -1,20 +1,25 @@
+import hashlib
+import io
 import json
 import os
 import pickle
 import random
 import traceback
-import hashlib
-from typing import Any, Optional, List, Dict
+from typing import Any, Dict, List, Optional
 
 import torch
-from datasets import load_dataset, concatenate_datasets, Dataset as HFDataset
+from datasets import Dataset as HFDataset
+from datasets import concatenate_datasets, load_dataset, load_from_disk
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
-from transformers import ProcessorMixin, PretrainedConfig
+from transformers import PretrainedConfig, ProcessorMixin
 
-from .utils import get_rope_index
 from ..registry import DATASET_REGISTRY
+from ..utils import logging, oss
+from .utils import get_rope_index
+
+logger = logging.get_logger(__name__)
 
 
 class SequenceLengthCalculator(Dataset):
@@ -82,10 +87,7 @@ class VLMDataset(Dataset):
         mm_max_length: int,
         fps: int,
         max_frames: int,
-        dataloader_num_workers: Optional[int],
-        output_dir: str,
         seed: int,
-        requires_length: bool = False,
     ):
         if torch.distributed.is_initialized():
             seed = torch.tensor(seed, device="cuda")
@@ -103,22 +105,32 @@ class VLMDataset(Dataset):
         self.seed = seed
 
         self._dataset = self._load_data()
-        if requires_length:
-            self.length = self._get_sequence_lengths(self._dataset, dataloader_num_workers, output_dir)
-        else:
-            self.length = None
 
-    def _get_sequence_lengths(self, dataset, num_workers, output_dir):
-        pickled_bytes = pickle.dumps(dataset, protocol=pickle.HIGHEST_PROTOCOL, fix_imports=False)
-        uid = hashlib.md5(pickled_bytes).hexdigest()
-        cache_file = os.path.join(output_dir, f"{uid}.pkl")
-        if os.path.exists(cache_file):
+    def get_sequence_lengths(self, num_workers, cache_dir):
+        if torch.distributed.get_rank() == 0:
+            pickled_bytes = pickle.dumps(self._dataset, protocol=pickle.HIGHEST_PROTOCOL, fix_imports=False)
+            md5_bytes = list(hashlib.md5(pickled_bytes).digest())
+        else:
+            md5_bytes = [0 for _ in range(16)]
+        md5_bytes = torch.as_tensor(md5_bytes, dtype=torch.uint8, device="cuda")
+        torch.distributed.broadcast(md5_bytes, src=0)
+
+        uid = bytes(md5_bytes.tolist()).hex()
+        cache_file = os.path.join(cache_dir, f"{uid}.pkl" )
+
+        if cache_dir.startswith("oss://") and oss.object_exists(cache_file):
+            with oss.get_object(cache_file) as result:
+                buffer = io.BytesIO(result.read())
+                lengths = pickle.load(buffer)
+                buffer.close()
+            return lengths
+        elif os.path.exists(cache_file):
             with open(cache_file, "rb") as f:
                 lengths = pickle.load(f)
             return lengths
 
         calculator = SequenceLengthCalculator(
-            dataset,
+            self._dataset,
             processor=self.processor,
             mm_max_length=self.mm_max_length,
             fps=self.fps,
@@ -133,7 +145,7 @@ class VLMDataset(Dataset):
             collate_fn=lambda x: x[0],
         )
 
-        lengths = [0 for _ in range(len(dataset))]
+        lengths = [0 for _ in range(len(self._dataset))]
         for i, length in tqdm(
             dataloader,
             desc="Calculate sequence lengths",
@@ -145,12 +157,18 @@ class VLMDataset(Dataset):
         torch.distributed.all_reduce(lengths, op=torch.distributed.ReduceOp.SUM)
         lengths = lengths.tolist()
 
-        assert len(lengths) == len(dataset)
+        assert len(lengths) == len(self._dataset)
 
         if torch.distributed.get_rank() == 0:
-            os.makedirs(output_dir, exist_ok=True)
-            with open(cache_file, "wb") as f:
-                pickle.dump(lengths, f)
+            if cache_dir.startswith("oss://"):
+                with io.BytesIO() as buffer:
+                    pickle.dump(lengths, buffer)
+                    buffer.seek(0)
+                    oss.put_object(cache_file, buffer)
+            else:
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(cache_file, "wb") as f:
+                    pickle.dump(lengths, f)
 
         return lengths
 
@@ -162,27 +180,19 @@ class VLMDataset(Dataset):
             data_path = [x["data_path"] for x in data_mixture]
             sampling_ratios = [x.get("sampling_ratio", 1.0) for x in data_mixture]
         elif self.data_path is not None:
-            if len(self.data_path) == 1 and os.path.isdir(self.data_path[0]):
-                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                    data_path = [
-                        os.path.join(data_path[0], x)
-                        for x in os.listdir(data_path[0])
-                        if os.path.isfile(os.path.join(data_path[0], x))
-                    ]
-                else:
-                    data_path = None
-                if torch.distributed.is_initialized():
-                    object_list = [data_path]
-                    torch.distributed.broadcast_object_list(object_list, src=0)
-                    data_path = object_list[0]
-            else:
-                data_path = self.data_path
+            data_path = self.data_path
             sampling_ratios = [1.0] * len(data_path)
         else:
             raise ValueError
 
         datasets = []
         for path, sampling_ratio in zip(data_path, sampling_ratios):
+            if os.path.isdir(path):
+                dataset = load_from_disk(path)
+                assert sampling_ratio == 1.0
+                datasets.append(dataset)
+                continue
+
             if path.endswith(".csv"):
                 data_format = "csv"
             elif path.endswith(".jsonl"):
@@ -269,8 +279,10 @@ class VLMDataset(Dataset):
             data_dict["data_index"] = index
         except Exception:
             traceback.print_exc()
-            backup_idx = random.randint(0, len(self) - 1)
-            print(f"Encounted error when process {index}-th example, use {backup_idx}-th example instead!!!")
+            # Ensuring deterministic for tp/pp
+            local_rng = random.Random(index)
+            backup_idx = local_rng.randint(0, len(self) - 1)
+            logger.warning(f"Encounted error when process {index}-th example, use {backup_idx}-th example instead!!!")
             return self.__getitem__(backup_idx)
         return data_dict
 
@@ -357,7 +369,9 @@ class PseudoVLMDataset(VLMDataset):
         generator = torch.Generator()
         generator.manual_seed(int(hash_hex, 16) % (2**32))
 
+        new_conversation = []
         for message in conversation:
+            new_contents = []
             for content in message["content"]:
                 if content["type"] == "image":
                     image = torch.randint(
@@ -368,13 +382,16 @@ class PseudoVLMDataset(VLMDataset):
                         generator=generator,
                     )
                     image = Image.fromarray(image.numpy())
-                    content["image"] = image
-                else:
-                    length = content.pop("length")
+                    new_contents.append({"type": "image", "image": image})
+                elif content["type"] == "text":
+                    length = content["length"]
                     token_ids = torch.randint(0, 128, size=(length,), dtype=torch.long, generator=generator)
-                    content["text"] = self.processor.decode(token_ids)
+                    new_contents.append({"type": "text", "text": self.processor.decode(token_ids)})
+                else:
+                    raise ValueError(f"Unsupported content type: {content['type']}")
+            new_conversation.append({"role": message["role"], "content": new_contents})
 
-        return conversation
+        return new_conversation
 
     def __repr__(self):
         return f"{self.__class__.__name__}(num_samples={len(self)})"

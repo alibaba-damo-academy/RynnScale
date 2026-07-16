@@ -1,10 +1,10 @@
+import json
 import os
 from abc import ABCMeta, abstractmethod
 from collections import defaultdict
 from types import MappingProxyType
 from typing import Any, Dict, List, Optional, Union
 
-import json
 from openai import AsyncOpenAI
 from torch.utils.data import Dataset
 
@@ -13,11 +13,11 @@ class BaseBenchmark(Dataset, metaclass=ABCMeta):
     def __init__(
         self,
         data_root: str,
-        use_cot: bool = False,
         prompt_format: Optional[str] = None,
+        enable_thinking: bool = False,
     ) -> None:
-        self.use_cot = use_cot
         self.prompt_format = prompt_format
+        self.enable_thinking = enable_thinking
 
         if os.getenv("ENDPOINT_URL", None):
             self.openai_client = AsyncOpenAI(
@@ -73,6 +73,7 @@ class BaseBenchmark(Dataset, metaclass=ABCMeta):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         output = {
             "data_ids": self._aggregated_data[idx]["data_ids"],
+            "enable_thinking": self.enable_thinking,
             "conversations": [
                 self.generate_instruction(data_id) for data_id in self._aggregated_data[idx]["data_ids"]
             ],

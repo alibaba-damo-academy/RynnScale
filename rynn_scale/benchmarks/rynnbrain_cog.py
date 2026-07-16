@@ -10,13 +10,15 @@ from ..registry import BENCHMARK_REGISTRY
 TASKS = {
     "object_conigtion": "rynnbrain_object_2000.jsonl",
     "spatial_conigtion": "rynnbrain_spatial_2000.jsonl",
+    # "object_conigtion": "rynnbrain_counting_200.jsonl",  # for COT Model
 }
 
 
 @BENCHMARK_REGISTRY.register()
 class RynnBrainCog(BaseBenchmark):
-    # INFER_LOCALIZATION = True
-    INFER_LOCALIZATION = False
+
+    # THINKING_MODE = True
+    THINKING_MODE = False
 
     TYPE_LIST = {
         "Object Cognition": [
@@ -87,45 +89,35 @@ class RynnBrainCog(BaseBenchmark):
         Load data from jsonl files.
         """
         data_dict = {}
-
+        
         for task_name, json_path in TASKS.items():
             data_path = os.path.join(data_root, json_path)
+            data_folder = os.path.join(data_root, "data")
+            
             # print('data_path', data_path)
             data_list = self._load_jsonl_file(data_path)
             # print('len(data_list)',len(data_list))
             for i, data in enumerate(data_list):
                 # if i<4:
                 #     continue
-                # if i>10:
+                # if i>0:
                 #     break
                 data_id = data.get("id", 0)
                 data_id = f"{task_name}_{data_id}"
                 task_type = data.get("task_type", "unknown")
                 conversation = data.get("conversation", [])
 
-                # resolve relative path TODO: remove this part, jsonl改成绝对路径
-                data_folder = "/mnt/damovl/scene_understanding/code/rynnecbench/rynnecbench/data/"
-                for turn in conversation:
-                    if "content" in turn and isinstance(turn["content"], list):
-                        for item in turn["content"]:
-                            if not isinstance(item, dict):
-                                continue
-                            item_type = item.get("type")
-                            if item_type == "image" and "image" in item and isinstance(item["image"], str):
-                                if not os.path.isabs(item["image"]):
-                                    item["image"] = os.path.join(data_folder, item["image"])
-
                 # resolve data
                 for msg in conversation:
                     if msg["role"] == "assistant":
                         # print('msg["content"]', msg["content"])
-                        assistant_content = msg.get("content", [])
+                        assistant_content = msg.get('content', [])
                         answer = assistant_content[-1].get("text", "") if assistant_content else ""
                     elif msg["role"] == "user":
-                        user_content = msg.get("content", [])
-                        image_path = [item["image"] for item in user_content if item.get("type") == "image"]
+                        user_content = msg.get('content', [])
+                        image_path = [os.path.join(data_folder, item['image']) for item in user_content if item.get('type') == 'image']
                         question = user_content[-1].get("text", "") if user_content else ""
-
+                
                 data_dict[data_id] = {
                     "images": image_path,
                     "ground_truth": answer,
@@ -142,6 +134,7 @@ class RynnBrainCog(BaseBenchmark):
         meta_data = self.data_dict[data_id]
         question = meta_data["question"]
         image_path = meta_data["images"]
+        task_type = meta_data["task_type"]
 
         # instruction = f'{question}'
 
@@ -151,71 +144,36 @@ class RynnBrainCog(BaseBenchmark):
             else f"{question}"
         )
 
+        if self.THINKING_MODE and task_type in ['counting']:
+            thinking_prompt = f"\nOutput format: `#### <answer><counting>N</counting></answer>` where N is the count."
+            question = f'{question}{thinking_prompt}'
+            self.SYSTEM_PROMPT = SYSTEM_PROMPT_COUNTING
+
         if isinstance(question, str):
             if not isinstance(image_path, list):
                 image_path = [image_path]
             content = []
             for i, path in enumerate(image_path):
                 content.append({"type": "text", "text": f"<frame {i}>: "})
-                content.append({"type": "image", "image": path})
+                content.append({"type": "image", "image": path})  
 
-            instruction = [
-                # {"role": "system", "content": "You are a helpful assistant."},
-                {
+            messages = []
+            if self.THINKING_MODE:
+                messages.append({"role": "system", "content": self.SYSTEM_PROMPT})
+            messages.append({
                     "role": "user",
                     "content": content + [{"type": "text", "text": question}],
-                }
-            ]
-            # print('instruction', instruction)
+            })
+            # print('messages', messages)
 
-            # # 找到所有 <frame N>; 的匹配对象（包括位置）
-            # pattern = r"<frame\s*(\d+)>;"
-            # matches = list(re.finditer(pattern, question))
-            # if not matches:
-            #     instruction = [
-            #         # {"role": "system", "content": "You are a helpful assistant."},
-            #         {
-            #             "role": "user",
-            #             "content": content + [{"type": "text", "text": question}],
-            #         }
-            #     ]
-            # else:
-            #     # 存储最终instruction
-            #     instruction = [
-            #         # {"role": "system", "content": "You are a helpful assistant."},
-            #         {
-            #             "role": "user",
-            #             "content": content,
-            #         }
-            #     ]
-            #     last_end = 0
-            #     for i, match in enumerate(matches):
-            #         start, end = match.span()  # 整个 "<frame N>;" 的起止位置
-            #         frame_idx = int(match.group(1))
-
-            #         # prefix instruction（可能为空）
-            #         prefix_text = question[last_end:end]
-            #         if prefix_text:
-            #             prefix_instruction = [{"type": "text", "text": prefix_text}]
-            #             instruction[0]['content'] = instruction[0]['content'] + prefix_instruction
-
-            #         # add visual instruction
-            #         visual_instruction = [{"type": "image",  "image": image_path[frame_idx]}]
-            #         instruction[0]['content'] = instruction[0]['content'] + visual_instruction
-            #         last_end = end
-
-            #     # suffix instrucion
-            #     suffix_text = question[last_end:]
-            #     if suffix_text:
-            #         suffix_instruction = [{"type": "text", "text": suffix_text}]
-            #         instruction[0]['content'] = instruction[0]['content'] + suffix_instruction
-            # print('instruction', instruction)
-
-        return instruction
+        return messages
 
     async def process_response(self, data_id: Union[int, str], response: str) -> Any:
         """Process the raw model response."""
         # Normalize the response similarly to the ground truth for fair comparison
+        if self.THINKING_MODE:
+            match = re.findall(r'<answer><counting>(.*?)</counting></answer>', response, re.DOTALL)
+            response = match[0].strip() if match else response
         return response.strip()
 
     async def get_matching_score(self, data_id, prediction):
@@ -235,7 +193,7 @@ class RynnBrainCog(BaseBenchmark):
             "type": task_type,
         }
         score = await calculate_score(record, self.openai_client)
-        print(f"| dataid: {data_id} | answer: {ground_truth} | pred: {prediction} | score: {score} |")
+        print(f'| dataid: {data_id} | answer: {ground_truth} | pred: {prediction} | score: {score} |')
         return score
 
     def compute_metrics(self, results):
@@ -286,6 +244,15 @@ class RynnBrainCog(BaseBenchmark):
         return metrics
         # return self._summarize_scores(results, category_key="task_type")
 
+SYSTEM_PROMPT_COUNTING = [
+    {
+        "type": "text",
+        "text": (
+            "You are an embodied agent. You are given a video to solve a counting problem. "
+            # "Put your final answer in the format of `#### <answer><counting>N</counting></answer>`."
+        ),
+    }
+]   
 
 SCORE_TYPE = {
     "camera_rotation": "numerical",
@@ -332,7 +299,7 @@ SCORE_TYPE = {
     "size": "gpt_multi_granularity",
 }
 
-UNIT_LIST = ["centimeters", "meters", "feet", "inches", "degrees", "o'clock"]
+UNIT_LIST = ["centimeters", "meters", "feet", "inches", "degrees", "o\'clock"]
 
 UNIT_EXCHANGE = {
     "length": {"centimeters": 100.0, "meters": 1.0, "inches": 39.3701, "feet": 3.28084},
@@ -483,7 +450,7 @@ async def score_by_gpt(item, client, score_type="binary"):
         completion = await client.chat.completions.create(
             model="gpt-4o-0806",
             messages=messages,
-            max_tokens=100,
+            max_completion_tokens=100,
         )
         response_raw = completion.choices[0].message.content
         response = response_raw.split("###Judge:")[1].strip()

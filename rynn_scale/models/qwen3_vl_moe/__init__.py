@@ -1,5 +1,5 @@
-from . import modeling_qwen3_vl_moe
 from ..qwen3_vl import processing_qwen3_vl
+from . import modeling_qwen3_vl_moe
 
 
 def apply_monkey_patch():

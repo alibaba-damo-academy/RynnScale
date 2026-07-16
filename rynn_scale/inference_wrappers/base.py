@@ -1,5 +1,5 @@
-from abc import abstractmethod, ABCMeta
-from typing import Dict, Any, List, Union
+from abc import ABCMeta, abstractmethod
+from typing import Any, Dict, List, Union
 
 import torch
 from transformers import BatchFeature

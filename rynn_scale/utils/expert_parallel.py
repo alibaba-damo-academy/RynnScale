@@ -1,3 +1,4 @@
+import inspect
 import os
 from typing import Any, List, Tuple
 
@@ -6,8 +7,7 @@ from deepspeed.moe.layer import MoE
 from deepspeed.utils import groups
 
 from .. import parallel_state as mpu
-from ..ops import all_to_all, deepep_dispatch, deepep_combine
-
+from ..ops import all_to_all, deepep_combine, deepep_dispatch, moe_token_permute, moe_token_unpermute
 
 MOE_DISPATCH_BACKEND = os.environ.get("MOE_DISPATCH_BACKEND", "deep_ep")
 
@@ -143,32 +143,27 @@ class MoETokenDispatcher(object):
             )
             self.handle = handle
         else:
-            expert_indices = expert_indices.flatten()
-            num_tokens_list = torch.bincount(expert_indices, minlength=self.num_experts).tolist()
+            num_tokens_list = torch.bincount(expert_indices.flatten(), minlength=self.num_experts).tolist()
 
-        expert_indices = expert_indices.flatten()
-        self.token_indices = torch.argsort(expert_indices, stable=True)
-        self.num_tokens = hidden_states.size(0)
-
-        if self.ep_world_size > 1:
-            num_valid_tokens = sum(num_tokens_list)
-            self.token_indices = self.token_indices[-num_valid_tokens:]
-
-        hidden_states = hidden_states.index_select(0, self.token_indices // self.num_experts_per_token)
+        hidden_states, permuted_indices = moe_token_permute(
+            hidden_states,
+            routed_expert_indices=expert_indices,
+            num_routed_tokens=num_tokens_list,
+            num_experts_per_token=self.num_experts_per_token,
+        )
 
         self.routing_scores = routing_scores
+        self.permuted_indices = permuted_indices
 
         return hidden_states, num_tokens_list
 
     def _combine_deepep(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_size = hidden_states.size(-1)
-
-        outputs = hidden_states.new_zeros((self.num_tokens * self.num_experts_per_token, hidden_size))
-        outputs.index_copy_(0, self.token_indices, hidden_states)
-        outputs = outputs.view(-1, self.num_experts_per_token, hidden_size)
-
-        outputs = outputs * self.routing_scores.type(outputs.dtype).unsqueeze(-1)
-        outputs = outputs.sum(dim=1)
+        outputs = moe_token_unpermute(
+            hidden_states,
+            probs=self.routing_scores,
+            permuted_indices=self.permuted_indices,
+            num_experts_per_token=self.num_experts_per_token,
+        )
 
         if self.ep_world_size > 1:
             outputs = deepep_combine(
@@ -177,9 +172,8 @@ class MoETokenDispatcher(object):
                 self.ep_group,
             )
 
-        self.token_indices = None
         self.routing_scores = None
-        self.handle = None
+        self.permuted_indices = None
 
         return outputs
 
@@ -190,7 +184,7 @@ class MoETokenDispatcher(object):
         routing_scores: torch.Tensor,
     ) -> Tuple[torch.Tensor, List[int]]:
         if self.backend == "all_to_all":
-            return self._dispatch_torch(
+            return self._dispatch_a2a(
                 hidden_states=hidden_states,
                 expert_indices=expert_indices,
                 routing_scores=routing_scores,
@@ -262,3 +256,52 @@ class BaseMoELayer(MoE):
         output = super()._apply(*args, **kwargs)
         self.mark_moe_parameters()
         return output
+
+
+def gather_ep_params(
+    model: torch.nn.Module,
+    convert: bool = True,
+):
+    if "convert" in inspect.signature(model.state_dict).parameters:
+        state_dict = model.state_dict(convert=convert)
+    else:
+        state_dict = model.state_dict()
+
+    if mpu.get_expert_data_parallel_rank() != 0:
+        torch.distributed.barrier()
+        return state_dict
+
+    ep_group = mpu.get_expert_model_parallel_group()
+    ep_size = mpu.get_expert_model_parallel_world_size()
+    ep_rank = mpu.get_expert_model_parallel_rank()
+
+    expert_param_names = set()
+    for module_name, module in model.named_modules():
+        if isinstance(module, BaseMoELayer):
+            for key in state_dict:
+                if key.startswith(module_name):
+                    expert_param_names.add(key)
+
+    for param_name in sorted(state_dict.keys()):
+        if param_name not in expert_param_names:
+            continue
+
+        param = state_dict[param_name].cuda()
+        if ep_rank == 0:
+            outputs = [torch.empty_like(param) for _ in range(ep_size)]
+        else:
+            outputs = None
+
+        torch.distributed.gather(
+            param,
+            outputs,
+            group=ep_group,
+            group_dst=0,
+        )
+
+        if ep_rank == 0:
+            new_param = torch.cat(outputs, dim=0)
+            state_dict[param_name] = new_param.cpu()
+
+    torch.distributed.barrier()
+    return state_dict

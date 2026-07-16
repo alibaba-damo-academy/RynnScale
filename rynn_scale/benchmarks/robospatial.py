@@ -1,13 +1,13 @@
+import ast
 import json
 import os
 import re
-import ast
 
 import numpy as np
 from PIL import Image
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 def point_in_polygon(x, y, poly):

@@ -1,8 +1,8 @@
 import json
 import os
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 def make_prompt(question, ground_truth, pred_answer):
@@ -65,7 +65,7 @@ class QAEgo4D(BaseBenchmark):
                 completion = await self.openai_client.chat.completions.create(
                     model="gpt-4o-0806",
                     messages=messages,
-                    max_tokens=100,
+                    max_completion_tokens=100,
                 )
                 response = completion.choices[0].message.content
                 score = float(int(response) / 5)

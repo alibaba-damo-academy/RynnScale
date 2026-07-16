@@ -1,11 +1,12 @@
-import os
 import io
-from PIL import Image
+import os
 import re
-import pandas as pd
 
-from .base import BaseBenchmark
+import pandas as pd
+from PIL import Image
+
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 @BENCHMARK_REGISTRY.register()

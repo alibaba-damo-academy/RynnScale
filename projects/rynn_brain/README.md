@@ -1,5 +1,5 @@
 <p align="center">
-<img src="./assets/logo.png" style="width: 40%; height: auto;">
+<img src="https://github.com/alibaba-damo-academy/RynnBrain/blob/main/cookbooks/assets/images/logo.png" style="width: 40%; height: auto;">
 </p>
 
 We present RynnBrain, an embodied foundation model grounded in physical reality. The goal of RynnBrain is not just to “observe” the environment, but to anchor its understanding within the physical world through comprehensive egocentric cognition, precise spatiotemporal grounding and real task planning. This systematic upgrade pushes the boundaries of embodied brains, moving them from passive observation toward active, physics-aware reasoning and complex task execution.

@@ -537,56 +537,37 @@ class Trainer(object):
                 for name, _ in module.named_parameters():
                     expert_parameters.add(f"{module_name}.{name}")
 
-        optimizer_grouped_parameters = [
-            {
-                "name": "decay",
-                "params": [
-                    p
-                    for n, p in opt_model.named_parameters()
-                    if p.requires_grad and n in decay_parameters and n not in expert_parameters
-                ],
-                "lr": self.args.learning_rate,
-                "weight_decay": self.args.weight_decay,
-            },
-            {
-                "name": "no_decay",
-                "params": [
-                    p
-                    for n, p in opt_model.named_parameters()
-                    if p.requires_grad and n not in decay_parameters and n not in expert_parameters
-                ],
-                "lr": self.args.learning_rate,
-                "weight_decay": 0.0,
-            },
-        ]
+        # Resolve a per-parameter learning rate from learning_rate_strategy: a parameter uses
+        # the learning rate of the first regex pattern (matched with re.search) it matches, and
+        # falls back to the default learning_rate when it matches none.
+        def resolve_lr(name):
+            for pattern, lr in self.args.learning_rate_strategy.items():
+                if re.search(pattern, name):
+                    return lr
+            return self.args.learning_rate
 
-        if len(expert_parameters) > 0:
-            optimizer_grouped_parameters.extend(
-                [
-                    {
-                        "name": f"ep_size_{self.args.ep_world_size}",
-                        "moe": True,
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if p.requires_grad and n in decay_parameters and n in expert_parameters
-                        ],
-                        "lr": self.args.learning_rate,
-                        "weight_decay": self.args.weight_decay,
-                    },
-                    {
-                        "name": f"ep_size_{self.args.ep_world_size}",
-                        "moe": True,
-                        "params": [
-                            p
-                            for n, p in opt_model.named_parameters()
-                            if p.requires_grad and n not in decay_parameters and n in expert_parameters
-                        ],
-                        "lr": self.args.learning_rate,
-                        "weight_decay": 0.0,
-                    },
-                ]
-            )
+        # Group parameters by (is_expert, is_decay, lr), preserving first-seen order.
+        grouped_parameters = {}
+        for n, p in opt_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            key = (n in expert_parameters, n in decay_parameters, resolve_lr(n))
+            grouped_parameters.setdefault(key, []).append(p)
+
+        optimizer_grouped_parameters = []
+        for (is_expert, is_decay, lr), params in grouped_parameters.items():
+            group = {
+                "params": params,
+                "lr": lr,
+                "weight_decay": self.args.weight_decay if is_decay else 0.0,
+            }
+            if is_expert:
+                # Preserve the exact name/flag DeepSpeed relies on for expert parallelism.
+                group["name"] = f"ep_size_{self.args.ep_world_size}"
+                group["moe"] = True
+            else:
+                group["name"] = "decay" if is_decay else "no_decay"
+            optimizer_grouped_parameters.append(group)
 
         optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)

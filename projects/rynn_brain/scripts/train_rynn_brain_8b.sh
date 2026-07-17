@@ -19,6 +19,7 @@ DATA_PATH=/path/to/annotations.jsonl
 
 
 DATA_ARGS=(
+    --data_type RynnBrainDataset
     --data_path $DATA_PATH
     --model_max_length 16384
     --mm_max_length 10240
@@ -37,7 +38,7 @@ OPTIMIZER_ARGS=(
 )
 
 TRAINING_ARGS=(
-    --deepspeed scripts/zero1.json
+    --deepspeed configs/zero1.json
     --gradient_checkpointing True
     --bf16 True
     --fp16 False
@@ -65,8 +66,7 @@ torchrun --nnodes $WORLD_SIZE \
     --node_rank $RANK \
     --rdzv_conf="timeout=7200,join_timeout=7200" \
     -m rynn_scale.api.train \
-    --model_path $MODEL_PATH
-    ${MODEL_ARGS[@]} \
+    --model_path $MODEL_PATH \
     ${DATA_ARGS[@]} \
     ${OPTIMIZER_ARGS[@]} \
     ${TRAINING_ARGS[@]} \

@@ -225,6 +225,16 @@ class TrainingArguments(ModelArguments, ParallelismArguments, DataArguments, Bas
     # Optimizer configs
     learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
     frozen_parameters: Optional[List[str]] = field(default=None)
+    learning_rate_strategy: Union[Dict[str, float], str] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Per-parameter learning rates as a JSON string mapping regex patterns to learning rates, "
+                'e.g. \'{"model.visual.": 1e-6}\'. A parameter uses the learning rate of the first pattern '
+                "(matched with re.search) it matches; parameters matching no pattern use learning_rate."
+            )
+        },
+    )
 
     lr_scheduler_type: Union[SchedulerType, str] = field(
         default="linear",
@@ -304,6 +314,9 @@ class TrainingArguments(ModelArguments, ParallelismArguments, DataArguments, Bas
 
     def __post_init__(self):
         super().__post_init__()
+
+        if isinstance(self.learning_rate_strategy, str):
+            self.learning_rate_strategy = json.loads(self.learning_rate_strategy)
 
         if self.encoder_gradient_checkpointing_interval is not None:
             assert self.gradient_checkpointing

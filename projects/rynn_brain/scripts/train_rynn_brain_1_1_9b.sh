@@ -13,8 +13,8 @@ echo "MASTER_ADDR: $MASTER_ADDR"
 echo "MASTER_PORT: $MASTER_PORT"
 
 
-MODEL_PATH=/path/to/Qwen3-VL-2B-Instruct
-OUTPUT_DIR=work_dirs/rynn_brain/2b
+MODEL_PATH=/path/to/Qwen3.5-9B
+OUTPUT_DIR=work_dirs/rynn_brain/9b
 DATA_PATH=/path/to/annotations.jsonl
 
 
@@ -31,7 +31,7 @@ DATA_ARGS=(
 )
 
 OPTIMIZER_ARGS=(
-    --learning_rate 1e-6
+    --learning_rate 2e-6
     --weight_decay 0.0
     --warmup_ratio 0.03
     --lr_scheduler_type "cosine"
@@ -40,6 +40,7 @@ OPTIMIZER_ARGS=(
 TRAINING_ARGS=(
     --deepspeed configs/zero1.json
     --gradient_checkpointing True
+    --loss_implementation cce
     --bf16 True
     --fp16 False
     --dataloader_num_workers 8

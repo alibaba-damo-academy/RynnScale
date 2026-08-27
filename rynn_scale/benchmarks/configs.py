@@ -24,4 +24,8 @@ DATA_PATH = {
     "Where2Place": "/mnt/damorobot/EVAL_BENCHMARK/where2place",
     "CosmosReason1": "/mnt/damorobot/EVAL_BENCHMARK/Cosmos-Reason1-Benchmark",
     "EmbSpatial": "/mnt/damorobot/EVAL_BENCHMARK/EmbSpatial-Bench",
+    "Detect3D": "/mnt/workspace/workgroup/wangzhikai/DATASETS/WildDet3D-Bench",
+    "Detect3DQwen": "/mnt/workspace/workgroup/wangzhikai/DATASETS/WildDet3D-Bench",
+    "Detect3DTrain": "/mnt/workspace/workgroup/ljp/DATASETS/WildDet3D-Train",
+    "Detect3DSUNRGBD": "/public/zjk_oss/wangzhikai/DATASETS/SUN_RGBD",
 }

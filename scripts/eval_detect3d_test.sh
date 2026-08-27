@@ -4,7 +4,6 @@
 
 
 MODEL_PATH="/path/to/model"
- 
 
 timestamp=$(date +"%Y%m%d_%H%M%S")
 # export DETECT3D_VIS_DIR=${save_dir}/vis

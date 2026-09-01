@@ -5,44 +5,66 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
+from torch.distributed.fsdp import fully_shard
 from torch.utils.checkpoint import checkpoint
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask
-from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
-from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5DecoderLayer,
-    Qwen3_5DynamicCache,
-    Qwen3_5GatedDeltaNet,
-    Qwen3_5ForConditionalGeneration,
-    Qwen3_5Model,
-    Qwen3_5ModelOutputWithPast,
-    Qwen3_5RMSNorm,
-    Qwen3_5TextModel,
-    Qwen3_5TextRotaryEmbedding,
-    Qwen3_5VisionModel,
-    Qwen3_5Attention,
-    Qwen3_5GatedDeltaNet,
-    eager_attention_forward,
-    apply_rotary_pos_emb,
-    apply_mask_to_padding_states,
+from transformers.modeling_layers import GradientCheckpointingLayer
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    BaseModelOutputWithPooling,
+    ModelOutput,
 )
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.modeling_outputs import ModelOutput
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5Attention as _Qwen3_5Attention,
+)
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5DecoderLayer as _Qwen3_5DecoderLayer,
+)
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5ForConditionalGeneration as _Qwen3_5ForConditionalGeneration,
+)
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5GatedDeltaNet as _Qwen3_5GatedDeltaNet,
+)
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5MLP,
+    Qwen3_5ModelOutputWithPast,
+    Qwen3_5TextRotaryEmbedding,
+    apply_mask_to_padding_states,
+    eager_attention_forward,
+)
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5Model as _Qwen3_5Model,
+)
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5RMSNorm as _Qwen3_5RMSNorm,
+)
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5TextModel as _Qwen3_5TextModel,
+)
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5VisionModel as _Qwen3_5VisionModel,
+)
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
 from ... import parallel_state as mpu
+from ...ops.norm import rms_norm
+from ...ops.rope import apply_rope
 from ...utils import context_parallel
+from .configuration_qwen3_5 import Qwen3_5Config
 
 
-class _Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
+class Qwen3_5GatedDeltaNet(_Qwen3_5GatedDeltaNet):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Qwen3_5DynamicCache | None = None,
+        cache_params: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ):
@@ -53,15 +75,16 @@ class _Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
         use_precomputed_states = (
             cache_params is not None
-            and cache_params.has_previous_state
+            and cache_params.has_previous_state(self.layer_idx)
             and seq_len == 1
             and cache_position is not None
         )
 
-        # getting projected states from cache if it exists
-        if cache_params is not None:
-            conv_state = cache_params.conv_states[self.layer_idx]
-            recurrent_state = cache_params.recurrent_states[self.layer_idx]
+        # getting projected states from cache if it exists (layers are lazily created,
+        # so only read once the linear-attention state for this layer actually exists)
+        if use_precomputed_states:
+            conv_state = cache_params.layers[self.layer_idx].conv_states
+            recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
         query, key, value = torch.split(
@@ -121,7 +144,7 @@ class _Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         else:
             if cache_params is not None:
                 conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
-                cache_params.conv_states[self.layer_idx] = conv_state
+                cache_params.update_conv_state(conv_state, self.layer_idx)
             if self.causal_conv1d_fn is not None:
                 mixed_qkv = self.causal_conv1d_fn(
                     x=mixed_qkv,
@@ -187,7 +210,7 @@ class _Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
         # Update cache
         if cache_params is not None:
-            cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+            cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
 
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -199,7 +222,7 @@ class _Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         return output
 
 
-class _Qwen3_5Attention(Qwen3_5Attention):
+class Qwen3_5Attention(_Qwen3_5Attention):
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -222,15 +245,19 @@ class _Qwen3_5Attention(Qwen3_5Attention):
         value_states = self.v_proj(hidden_states).view(hidden_shape)
 
         query_states, key_states, value_states = context_parallel.ulysses_preprocess(
-            query_states, key_states, value_states,
+            query_states,
+            key_states,
+            value_states,
         )
+
+        cos, sin = position_embeddings
+        cos = cos[..., : cos.shape[-1] // 2]
+        sin = sin[..., : sin.shape[-1] // 2]
+        query_states, key_states = apply_rope(query_states, key_states, cos, sin, inplace=True)
 
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -269,11 +296,11 @@ def get_seq_idx(cu_seqlens: torch.Tensor) -> torch.Tensor:
     return seq_idx.unsqueeze(0)
 
 
-class _Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
+class Qwen3_5GatedDeltaNet(_Qwen3_5GatedDeltaNet):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Qwen3_5DynamicCache | None = None,
+        cache_params: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         cu_seq_lens: torch.Tensor | None = None,
@@ -286,15 +313,16 @@ class _Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
         use_precomputed_states = (
             cache_params is not None
-            and cache_params.has_previous_state
+            and cache_params.has_previous_state(self.layer_idx)
             and seq_len == 1
             and cache_position is not None
         )
 
-        # getting projected states from cache if it exists
-        if cache_params is not None:
-            conv_state = cache_params.conv_states[self.layer_idx]
-            recurrent_state = cache_params.recurrent_states[self.layer_idx]
+        # getting projected states from cache if it exists (layers are lazily created,
+        # so only read once the linear-attention state for this layer actually exists)
+        if use_precomputed_states:
+            conv_state = cache_params.layers[self.layer_idx].conv_states
+            recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
         query, key, value = torch.split(
@@ -354,7 +382,7 @@ class _Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         else:
             if cache_params is not None:
                 conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
-                cache_params.conv_states[self.layer_idx] = conv_state
+                cache_params.update_conv_state(conv_state, self.layer_idx)
             mixed_qkv = self.causal_conv1d_fn(
                 x=mixed_qkv,
                 weight=conv_weight.squeeze(1),
@@ -411,7 +439,7 @@ class _Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
         # Update cache
         if cache_params is not None:
-            cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+            cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
 
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -423,7 +451,7 @@ class _Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         return output
 
 
-class _Qwen3_5DecoderLayer(Qwen3_5DecoderLayer):
+class Qwen3_5DecoderLayer(_Qwen3_5DecoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -482,7 +510,13 @@ class Qwen3_5CausalLMOutputWithPast(ModelOutput):
     rope_deltas: Optional[torch.LongTensor] = None
 
 
-class _Qwen3_5VisionModel(Qwen3_5VisionModel):
+def apply_rotary_pos_emb_vision(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return apply_rope(q.contiguous(), k.contiguous(), cos, sin, inplace=True)
+
+
+class Qwen3_5VisionModel(_Qwen3_5VisionModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gradient_checkpointing_interval = None
@@ -515,9 +549,7 @@ class _Qwen3_5VisionModel(Qwen3_5VisionModel):
         dispatcher = context_parallel.EncoderContextDispatcher(grid_thw=grid_thw, merge_size=self.spatial_merge_size)
         hidden_states = dispatcher.dispatch(hidden_states)
         rotary_pos_emb = dispatcher.dispatch(rotary_pos_emb)
-
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        position_embeddings = (rotary_pos_emb.cos(), rotary_pos_emb.sin())
 
         if dispatcher.cu_seqlens is not None:
             cu_seqlens = grid_thw.new_tensor(dispatcher.cu_seqlens, dtype=torch.int32)
@@ -610,27 +642,19 @@ class _Qwen3_5VisionModel(Qwen3_5VisionModel):
         return flops
 
 
-class _Qwen3_5RMSNorm(Qwen3_5RMSNorm):
+class Qwen3_5RMSNorm(_Qwen3_5RMSNorm):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return F.rms_norm(
-            hidden_states,
-            normalized_shape=[hidden_states.size(-1)],
-            weight=self.weight + 1.0,
-            eps=self.eps,
-        )
+        return rms_norm(hidden_states, self.weight + 1.0, eps=self.eps)
 
 
-class _Qwen3_5TextModel(Qwen3_5TextModel):
+class Qwen3_5TextModel(_Qwen3_5TextModel):
     def __init__(self, config: Qwen3_5TextConfig):
-        super(Qwen3_5TextModel, self).__init__(config)
+        super(_Qwen3_5TextModel, self).__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleDict(
-            {
-                str(layer_idx): _Qwen3_5DecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            }
+            {str(layer_idx): Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)}
         )
-        self.norm = _Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -659,7 +683,7 @@ class _Qwen3_5TextModel(Qwen3_5TextModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = Qwen3_5DynamicCache(config=self.config)
+            past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -687,7 +711,7 @@ class _Qwen3_5TextModel(Qwen3_5TextModel):
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
+        linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -719,7 +743,7 @@ class _Qwen3_5TextModel(Qwen3_5TextModel):
         )
 
 
-class _Qwen3_5Model(Qwen3_5Model):
+class Qwen3_5Model(_Qwen3_5Model):
     def get_multimodal_features(
         self,
         pixel_values: Optional[torch.Tensor] = None,
@@ -737,9 +761,7 @@ class _Qwen3_5Model(Qwen3_5Model):
             image_grid_thw = torch.zeros((0, 3), dtype=torch.long, device=self.visual.device)
 
         if pixel_values_videos is None:
-            pixel_values_videos = torch.zeros(
-                0, patch_channels, dtype=self.visual.dtype, device=self.visual.device
-            )
+            pixel_values_videos = torch.zeros(0, patch_channels, dtype=self.visual.dtype, device=self.visual.device)
             video_grid_thw = torch.zeros((0, 3), dtype=torch.long, device=self.visual.device)
 
         pixel_values = torch.cat([pixel_values, pixel_values_videos], dim=0).type(self.visual.dtype)
@@ -792,12 +814,10 @@ class _Qwen3_5Model(Qwen3_5Model):
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5ModelOutputWithPast:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
         if inputs_embeds is None:
             sequence_splitter, kwargs = context_parallel.get_sequence_splitter(
-                input_ids.size(1), attn_kwargs=kwargs,
+                input_ids.size(1),
+                attn_kwargs=kwargs,
             )
             inputs_embeds = self.get_input_embeddings()(input_ids[:, sequence_splitter])
         else:
@@ -853,7 +873,7 @@ class _Qwen3_5Model(Qwen3_5Model):
 
     def floating_point_ops(self, inputs: Dict[str, Any]):
         raise NotImplementedError
-    
+
     def apply_pipeline_parallel(
         self,
         num_stages: int,
@@ -862,7 +882,6 @@ class _Qwen3_5Model(Qwen3_5Model):
     ):
         num_layers = len(self.language_model.layers)
         assert (num_layers + reduced_layers_in_stage_zero) % num_stages == 0
-        assert not self.config.text_config.tie_word_embeddings
 
         num_local_layers = [
             (num_layers + reduced_layers_in_stage_zero) // num_stages - reduced_layers_in_stage_zero
@@ -884,13 +903,145 @@ class _Qwen3_5Model(Qwen3_5Model):
                 del self.language_model.layers[str(layer_idx)]
 
         if stage_index > 0:
-            del self.visual, self.language_model.embed_tokens
+            del self.visual
+            tied = self.config.text_config.tie_word_embeddings
+            mtp_enabled = getattr(self.config, "mtp_loss_weight", 0) > 0
+            keep_embed_on_last = (stage_index == num_stages - 1) and (tied or mtp_enabled)
+            if not keep_embed_on_last:
+                del self.language_model.embed_tokens
 
         if stage_index < num_stages - 1:
             del self.language_model.norm
 
+    def apply_fully_sharded_data_parallel(
+        self,
+        device_mesh: torch.distributed.DeviceMesh,
+        expert_device_mesh: torch.distributed.DeviceMesh,
+        mp_policy: torch.distributed.fsdp.MixedPrecisionPolicy,
+        reshard_after_forward: bool = False,
+    ):
+        fsdp_config = {
+            "reshard_after_forward": reshard_after_forward,
+            "mp_policy": mp_policy,
+        }
 
-class _Qwen3_5ForConditionalGeneration(Qwen3_5ForConditionalGeneration):
+        if hasattr(self, "visual"):
+            fully_shard(self.visual, mesh=device_mesh["dp"], **fsdp_config)
+
+        if hasattr(self.language_model, "embed_tokens"):
+            fully_shard(self.language_model.embed_tokens, mesh=device_mesh["dp"], **fsdp_config)
+
+        for layer_id, layer in self.language_model.layers.items():
+            fully_shard(layer, mesh=device_mesh["dp"], **fsdp_config)
+
+        if hasattr(self.language_model, "norm"):
+            fully_shard(self.language_model.norm, mesh=device_mesh["dp"], **fsdp_config)
+
+        fully_shard(self, mesh=device_mesh["dp"], **fsdp_config)
+
+
+class Qwen3_5MultiTokenPredictionLayer(GradientCheckpointingLayer):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = Qwen3_5Attention(config, layer_idx)
+        self.mlp = Qwen3_5MLP(config, config.intermediate_size)
+        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.FloatTensor:
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
+class Qwen3_5MultiTokenPredictionModule(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden_size = config.text_config.hidden_size
+        rms_norm_eps = config.text_config.rms_norm_eps
+
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.fc = nn.Linear(2 * hidden_size, hidden_size, bias=False)
+        self.layers = nn.ModuleList(
+            [Qwen3_5MultiTokenPredictionLayer(config.text_config, layer_idx=config.text_config.num_hidden_layers)]
+        )
+        self.norm = Qwen3_5RMSNorm(hidden_size, eps=rms_norm_eps)
+
+    def forward(
+        self,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        input_embeds = self.pre_fc_norm_embedding(input_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = self.fc(torch.cat([input_embeds, hidden_states], dim=-1))
+        hidden_states = self.layers[0](
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        return self.norm(hidden_states)
+
+
+def roll_sequence(
+    tensor: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    dim: int = 1,
+    value: Optional[int | float] = None,
+):
+    rolled_tensor = tensor.clone()
+    for i in range(len(cu_seq_lens) - 1):
+        start_idx = cu_seq_lens[i]
+        end_idx = cu_seq_lens[i + 1]
+        seq_slice = tensor[..., start_idx:end_idx]
+        rolled_seq = torch.roll(seq_slice, shifts=-1, dims=dim)
+        if value is not None:
+            rolled_seq[..., -1] = value
+        rolled_tensor[..., start_idx:end_idx] = rolled_seq
+    return rolled_tensor
+
+
+class Qwen3_5ForConditionalGeneration(_Qwen3_5ForConditionalGeneration):
+    def __init__(self, config):
+        super(_Qwen3_5ForConditionalGeneration, self).__init__(config)
+        self.model = Qwen3_5Model(config)
+        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+
+        if self.config.mtp_loss_weight > 0:
+            self.mtp = Qwen3_5MultiTokenPredictionModule(config)
+
+        self.post_init()
+
     @can_return_tuple
     def forward(
         self,
@@ -930,16 +1081,44 @@ class _Qwen3_5ForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         if hasattr(self, "lm_head"):
             if labels is not None:
                 sequence_splitter, _ = context_parallel.get_sequence_splitter(
-                    labels.size(1), attn_kwargs=kwargs,
+                    labels.size(1),
+                    attn_kwargs=kwargs,
                 )
                 loss = self.loss_function(
                     hidden_states=hidden_states,
                     lm_head=self.lm_head,
-                    position_ids=position_ids,
+                    cu_seq_lens=kwargs["cu_seq_lens_q"],
                     labels=labels,
                     num_items_in_batch=kwargs["num_items_in_batch"],
                     sequence_splitter=sequence_splitter,
                 )
+
+                if self.config.mtp_loss_weight > 0:
+                    input_ids = roll_sequence(input_ids, cu_seq_lens=kwargs["cu_seq_lens_q"], dim=1)
+                    position_ids = roll_sequence(position_ids, cu_seq_lens=kwargs["cu_seq_lens_q"], dim=-1)
+                    labels = roll_sequence(labels, cu_seq_lens=kwargs["cu_seq_lens_q"], dim=1, value=-100)
+                    hidden_states = roll_sequence(hidden_states, cu_seq_lens=kwargs["cu_seq_lens_q"], dim=1)
+
+                    inputs_embeds = self.model.language_model.embed_tokens(input_ids)
+                    position_embeddings = self.model.language_model.rotary_emb(inputs_embeds, position_ids)
+
+                    mtp_hidden_states = self.mtp(
+                        inputs_embeds,
+                        hidden_states=hidden_states,
+                        position_embeddings=position_embeddings,
+                        **kwargs,
+                    )
+
+                    mtp_loss = self.loss_function(
+                        hidden_states=mtp_hidden_states,
+                        lm_head=self.lm_head,
+                        cu_seq_lens=kwargs["cu_seq_lens_q"],
+                        labels=labels,
+                        num_items_in_batch=kwargs["num_items_in_batch"],
+                        sequence_splitter=sequence_splitter,
+                    )
+                    loss += mtp_loss * self.config.mtp_loss_weight
+
             else:
                 slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
                 logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -967,21 +1146,63 @@ class _Qwen3_5ForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             stage_index=stage_index,
             reduced_layers_in_stage_zero=reduced_layers_in_stage_zero,
         )
+
         if stage_index < num_stages - 1:
             del self.lm_head
+            if hasattr(self, "mtp"):
+                del self.mtp
+
+    def apply_fully_sharded_data_parallel(
+        self,
+        device_mesh: torch.distributed.DeviceMesh,
+        expert_device_mesh: torch.distributed.DeviceMesh,
+        mp_policy: torch.distributed.fsdp.MixedPrecisionPolicy,
+        reshard_after_forward: bool = False,
+    ):
+        fsdp_config = {
+            "reshard_after_forward": reshard_after_forward,
+            "mp_policy": mp_policy,
+        }
+
+        if hasattr(self.model, "visual"):
+            fully_shard(self.model.visual, mesh=device_mesh["dp"], **fsdp_config)
+
+        if hasattr(self.model.language_model, "embed_tokens"):
+            if self.config.tie_word_embeddings and hasattr(self, "lm_head"):
+                fully_shard(
+                    [self.model.language_model.embed_tokens, self.lm_head], mesh=device_mesh["dp"], **fsdp_config
+                )
+            else:
+                fully_shard(self.model.language_model.embed_tokens, mesh=device_mesh["dp"], **fsdp_config)
+                if hasattr(self, "lm_head"):
+                    fully_shard(self.lm_head, mesh=device_mesh["dp"], **fsdp_config)
+
+        for layer_id, layer in self.model.language_model.layers.items():
+            fully_shard(layer, mesh=device_mesh["dp"], **fsdp_config)
+
+        if hasattr(self.model.language_model, "norm"):
+            fully_shard(self.model.language_model.norm, mesh=device_mesh["dp"], **fsdp_config)
+
+        if hasattr(self, "mtp"):
+            fully_shard(self.mtp, mesh=device_mesh["dp"], **fsdp_config)
+
+        fully_shard(self, mesh=device_mesh["dp"], **fsdp_config)
 
 
 def apply_monkey_patch():
-    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5Attention = _Qwen3_5Attention
-    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet = _Qwen3_5GatedDeltaNet
-    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5RMSNorm = _Qwen3_5RMSNorm
-    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5DecoderLayer = _Qwen3_5DecoderLayer
+    transformers.models.qwen3_5.modeling_qwen3_5.apply_rotary_pos_emb_vision = apply_rotary_pos_emb_vision
+    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5Attention = Qwen3_5Attention
+    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet = Qwen3_5GatedDeltaNet
+    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5RMSNorm = Qwen3_5RMSNorm
+    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5DecoderLayer = Qwen3_5DecoderLayer
 
-    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5VisionModel = _Qwen3_5VisionModel
-    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5TextModel = _Qwen3_5TextModel
+    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5VisionModel = Qwen3_5VisionModel
+    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5TextModel = Qwen3_5TextModel
 
-    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5Model = _Qwen3_5Model
-    transformers.models.auto.modeling_auto.MODEL_MAPPING[Qwen3_5Config] = _Qwen3_5Model
+    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5Model = Qwen3_5Model
+    transformers.models.auto.modeling_auto.MODEL_MAPPING[Qwen3_5Config] = Qwen3_5Model
 
-    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration = _Qwen3_5ForConditionalGeneration
-    transformers.models.auto.modeling_auto.MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING[Qwen3_5Config] = _Qwen3_5ForConditionalGeneration
+    transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration = Qwen3_5ForConditionalGeneration
+    transformers.models.auto.modeling_auto.MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING[Qwen3_5Config] = (
+        Qwen3_5ForConditionalGeneration
+    )

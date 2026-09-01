@@ -1,16 +1,12 @@
-from abc import ABCMeta, abstractmethod
+from abc import ABC, abstractmethod
 from enum import Enum
 from queue import Queue
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 import torch.distributed as dist
-from deepspeed.pipe import PipelineModule as _PipelineModule
-from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
-from deepspeed.runtime.engine import MEMORY_OPT_ALLREDUCE_SIZE, DeepSpeedEngine
-from deepspeed.runtime.pipe.topology import PipelineParallelGrid, ProcessTopology
-from deepspeed.runtime.zero.config import ZeroStageEnum
-from transformers import PreTrainedModel
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor import distribute_tensor
 
 from .. import parallel_state as mpu
 from ..utils import logging
@@ -18,52 +14,18 @@ from ..utils import logging
 logger = logging.get_logger(__name__)
 
 
-class PipelineModule(_PipelineModule):
-    def __init__(self, module: PreTrainedModel):
-        super(_PipelineModule, self).__init__()
-        self.module = module
-
-        # DeepSpeed compatibility
-        pp_world_size = mpu.get_pipeline_model_parallel_world_size()
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
-        dcp_world_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
-        dcp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
-
-        self._topo = ProcessTopology(
-            axes=["pipe", "data"],
-            dims=[pp_world_size, dcp_world_size],
-        )
-        self._grid = PipelineParallelGrid(self._topo)
-
-        assert self._grid.get_pipeline_model_parallel_rank() == pp_rank
-        assert self._grid.get_data_parallel_rank() == dcp_rank
-
-        self.loss_fn = None
-
-        self.tied_comms = {}
-        self.activation_checkpoint_interval = -1
-        self.dynamic_shape = False
-
-        layer_indices = sorted(self.module.get_decoder().layers.keys())
-        self._local_start = int(layer_indices[0])
-        self._local_stop = int(layer_indices[-1]) + 1
-
-    def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
-
-
 class PipelineStage(object):
     def __init__(
         self,
-        module: torch.nn.Module,
-        deepspeed_engine: DeepSpeedEngine,
+        module: FSDPModule,
         group: torch.distributed.ProcessGroup,
+        dtype: torch.dtype | None = None,
     ):
         self.module = module
         self.group = group
-        self.deepspeed_engine = deepspeed_engine
-
-        self.using_bf16_optimizer = type(self.deepspeed_engine.optimizer) is BF16_Optimizer
+        # P2P recv buffers must match the sent activation dtype (FSDP mp_policy
+        # param_dtype), which differs from module.dtype (fp32 master params).
+        self.dtype = dtype if dtype is not None else module.dtype
 
         self.num_stages = dist.get_world_size(self.group)
         self.stage_index = dist.get_rank(self.group)
@@ -92,6 +54,9 @@ class PipelineStage(object):
     def device(self):
         return self.module.device
 
+    def set_requires_gradient_sync(self, requires_gradient_sync: bool):
+        self.module.set_requires_gradient_sync(requires_gradient_sync)
+
     @torch.cuda.nvtx.range("forward")
     def forward_one_chunk(
         self,
@@ -109,11 +74,14 @@ class PipelineStage(object):
         if self.is_first_stage:
             assert "input_ids" in model_inputs
         else:
-            model_inputs.pop("input_ids", None)
             assert self.fwd_recv_buffer is not None
             self.fwd_recv_buffer.requires_grad_(True)
             self.input_queue.put(self.fwd_recv_buffer)
             model_inputs["inputs_embeds"] = self.fwd_recv_buffer
+            # MTP on the last stage re-embeds shifted input_ids, so keep them.
+            mtp_enabled = getattr(self.module.config, "mtp_loss_weight", 0) > 0
+            if not (self.is_last_stage and mtp_enabled):
+                model_inputs.pop("input_ids", None)
 
         if self.is_last_stage:
             assert "labels" in model_inputs
@@ -139,7 +107,9 @@ class PipelineStage(object):
                     self.group,
                 )
             )
-            logger.debug(f"stage {self.stage_index + 1}/{self.num_stages}, send output: {outputs.last_hidden_state.shape}")
+            logger.debug(
+                f"stage {self.stage_index + 1}/{self.num_stages}, send output: {outputs.last_hidden_state.shape}"
+            )
 
         return loss, send_ops
 
@@ -150,23 +120,11 @@ class PipelineStage(object):
 
         logger.debug(f"stage {self.stage_index + 1}/{self.num_stages}, backward batch {batch_index + 1}")
         if self.is_last_stage:
-            self.deepspeed_engine.backward(output)
+            output.backward()
         else:
-            # https://github.com/deepspeedai/DeepSpeed/blob/master/deepspeed/runtime/pipe/engine.py#L805
-            if self.using_bf16_optimizer:
-                # manually call because we don't call optimizer.backward()
-                self.deepspeed_engine.optimizer.clear_lp_grads()
-
-            self.deepspeed_engine._running_engine_backward = True
             assert self.bwd_recv_buffer is not None
             output.backward(self.bwd_recv_buffer)
             self.bwd_recv_buffer = None
-            self.deepspeed_engine._running_engine_backward = False
-
-            if self.using_bf16_optimizer:
-                # manually call because we don't call optimizer.backward()
-                if not self.deepspeed_engine._config.bfloat16_config.immediate_grad_update:
-                    self.deepspeed_engine.optimizer.update_hp_grads(clear_lp_grads=False)
 
         send_ops = []
         if not self.is_first_stage:
@@ -206,11 +164,13 @@ class PipelineStage(object):
             shape = self._shape_inference(batch)
             self.fwd_recv_buffer = torch.empty(
                 size=(*shape, self.hidden_size),
-                dtype=self.module.dtype,
+                dtype=self.dtype,
                 device=self.module.device,
             )
             ops.append(dist.P2POp(dist.irecv, self.fwd_recv_buffer, self.prev_stage_rank, self.group))
-            logger.debug(f"stage {self.stage_index + 1}/{self.num_stages}, receive input: {self.fwd_recv_buffer.shape}")
+            logger.debug(
+                f"stage {self.stage_index + 1}/{self.num_stages}, receive input: {self.fwd_recv_buffer.shape}"
+            )
         return ops
 
     def get_bwd_recv_ops(self, batch: Dict[str, Any]) -> List[dist.P2POp]:
@@ -219,12 +179,51 @@ class PipelineStage(object):
             shape = self._shape_inference(batch)
             self.bwd_recv_buffer = torch.empty(
                 size=(*shape, self.hidden_size),
-                dtype=self.module.dtype,
+                dtype=self.dtype,
                 device=self.device,
             )
             ops.append(dist.P2POp(dist.irecv, self.bwd_recv_buffer, self.next_stage_rank, self.group))
             logger.debug(f"stage {self.stage_index + 1}/{self.num_stages}, receive grad: {self.bwd_recv_buffer.shape}")
         return ops
+
+    def _has_pp_shared_embedding(self) -> bool:
+        if self.num_stages <= 1:
+            return False
+        config = self.module.config
+        tied = getattr(config, "tie_word_embeddings", False)
+        mtp_enabled = getattr(config, "mtp_loss_weight", 0) > 0
+        return tied or mtp_enabled
+
+    def all_reduce_embedding_grads(self):
+        if not self._has_pp_shared_embedding():
+            return
+
+        if not (self.is_first_stage or self.is_last_stage):
+            return
+
+        embeddings = self.module.get_input_embeddings()
+        grad = embeddings.weight.grad
+        if grad is None:
+            return
+
+        new_grad = grad.full_tensor()
+        torch.distributed.all_reduce(new_grad, group=mpu.get_embedding_group())
+
+        embeddings.weight.grad = distribute_tensor(
+            new_grad,
+            device_mesh=grad.device_mesh,
+            placements=grad.placements,
+        )
+
+    def get_pp_shared_params(self) -> List[torch.nn.Parameter]:
+        if not self._has_pp_shared_embedding():
+            return []
+        if not self.is_last_stage or self.is_first_stage:
+            return []
+        embeddings = self.module.get_input_embeddings()
+        if embeddings is None or embeddings.weight is None:
+            return []
+        return [embeddings.weight]
 
 
 def _batch_isend_irecv(ops: List[dist.P2POp]) -> List[dist.Work]:
@@ -233,72 +232,49 @@ def _batch_isend_irecv(ops: List[dist.P2POp]) -> List[dist.Work]:
     return dist.batch_isend_irecv(ops)
 
 
-class ScheduleNoPipelining(object):
-    def __init__(
-        self,
-        stages: List[PipelineStage],
-        deepspeed_engine: DeepSpeedEngine,
-    ):
+class BasePipelineSchedule(ABC):
+    def __init__(self, stages: List[PipelineStage]):
         assert isinstance(stages, (list, tuple)) and len(stages) > 0
         self.stages = stages
-        self.deepspeed_engine = deepspeed_engine
-
-    def step(self, batches: List[Dict[str, Any]]):
-        self.deepspeed_engine.set_gradient_accumulation_boundary(is_boundary=False)
-        losses = []
-        for i in range(len(batches)):
-            loss, _ = self.stages[0].forward_one_chunk(batches, batch_index=i)
-            if i == len(batches) - 1:
-                self.deepspeed_engine.set_gradient_accumulation_boundary(is_boundary=True)
-            self.stages[0].backward_one_chunk(batch_index=i)
-            losses.append(loss)
-        return torch.stack(losses).to(torch.float32)
-
-
-class BasePipelineSchedule(ScheduleNoPipelining, metaclass=ABCMeta):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.using_bf16_optimizer = type(self.deepspeed_engine.optimizer) is BF16_Optimizer
-        self.deepspeed_engine.enable_backward_allreduce = False
-        assert self.deepspeed_engine.zero_optimization_stage() < ZeroStageEnum.gradients, (
-            "ZeRO-2 and ZeRO-3 are incompatible with pipeline parallelism"
-        )
 
     @abstractmethod
     def _step(self, batches: List[Dict[str, Any]]):
-        raise NotImplementedError
+        pass
 
     def step(self, batches: List[Dict[str, Any]]):
-        self.deepspeed_engine.set_gradient_accumulation_boundary(is_boundary=False)
         losses = self._step(batches)
-        self.deepspeed_engine.set_gradient_accumulation_boundary(is_boundary=True)
-
-        if self.using_bf16_optimizer:
-            # PP+BF16 work for ZeRO Stage 1
-            self.deepspeed_engine._bf16_reduce_grads()
-        else:
-            self.deepspeed_engine.allreduce_gradients(bucket_size=MEMORY_OPT_ALLREDUCE_SIZE)
-
+        for stage in self.stages:
+            stage.all_reduce_embedding_grads()
         return losses
 
 
-class ScheduleGPipe(BasePipelineSchedule):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        assert len(self.stages) == 1
+class ScheduleNoPipelining(BasePipelineSchedule):
+    def _step(self, batches: List[Dict[str, Any]]):
+        loss_scaling_factor = 1 / len(batches)
+        stage = self.stages[0]
+        losses = []
+        for i in range(len(batches)):
+            stage.set_requires_gradient_sync(i == len(batches) - 1)
+            loss, _ = stage.forward_one_chunk(
+                batches,
+                batch_index=i,
+                loss_scaling_factor=loss_scaling_factor,
+            )
+            stage.backward_one_chunk(batch_index=i)
+            losses.append(loss)
+        return torch.stack(losses).to(torch.float32) * len(batches)
 
+
+class ScheduleGPipe(BasePipelineSchedule):
     def _step(self, batches: List[Dict[str, Any]]):
         raise NotImplementedError
 
 
 class Schedule1F1B(BasePipelineSchedule):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        assert len(self.stages) == 1
-
     def _step(self, batches: List[Dict[str, Any]]):
         loss_scaling_factor = 1 / len(batches)
         stage = self.stages[0]
+        stage.set_requires_gradient_sync(False)
         losses = []
 
         # Last stage has 1 warmup, second-to-last 2 warmups, ...
@@ -338,6 +314,9 @@ class Schedule1F1B(BasePipelineSchedule):
             for work in _batch_isend_irecv(fwd_sends + bwd_recvs):
                 work.wait()
 
+            if bwd_mb_index == len(batches) - 1:
+                stage.set_requires_gradient_sync(True)
+
             bwd_sends = stage.backward_one_chunk(batch_index=bwd_mb_index)
             bwd_mb_index += 1
 
@@ -364,6 +343,9 @@ class Schedule1F1B(BasePipelineSchedule):
             bwd_recvs = stage.get_bwd_recv_ops(batches[bwd_mb_index])
             for work in _batch_isend_irecv(bwd_recvs):
                 work.wait()
+
+            if bwd_mb_index == len(batches) - 1:
+                stage.set_requires_gradient_sync(True)
 
             bwd_sends = stage.backward_one_chunk(batch_index=bwd_mb_index)
 

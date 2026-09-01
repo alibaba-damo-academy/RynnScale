@@ -1,23 +1,21 @@
 import hashlib
-import io
 import json
 import os
 import pickle
 import random
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 from datasets import Dataset as HFDataset
-from datasets import concatenate_datasets, load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import PretrainedConfig, ProcessorMixin
+from transformers import ProcessorMixin
 
 from ..registry import DATASET_REGISTRY
-from ..utils import logging, oss
-from .utils import get_rope_index
+from ..utils import logging, storage
 
 logger = logging.get_logger(__name__)
 
@@ -30,6 +28,7 @@ class SequenceLengthCalculator(Dataset):
         mm_max_length: int,
         fps: int,
         max_frames: int,
+        **kwargs,
     ):
         self.dataset = dataset
         self.processor = processor
@@ -79,31 +78,21 @@ class SequenceLengthCalculator(Dataset):
 class VLMDataset(Dataset):
     def __init__(
         self,
-        model_config: PretrainedConfig,
-        processor: ProcessorMixin,
-        data_path: Optional[List[str]],
-        data_mixture: Optional[str],
+        data_path: str,
         model_max_length: int,
         mm_max_length: int,
         fps: int,
         max_frames: int,
         seed: int,
     ):
-        if torch.distributed.is_initialized():
-            seed = torch.tensor(seed, device="cuda")
-            torch.distributed.broadcast(seed, src=0)
-            seed = seed.item()
-
-        self.model_config = model_config
-        self.processor = processor
         self.data_path = data_path
-        self.data_mixture = data_mixture
         self.model_max_length = model_max_length
         self.mm_max_length = mm_max_length
         self.fps = fps
         self.max_frames = max_frames
         self.seed = seed
 
+        self.processor = None
         self._dataset = self._load_data()
 
     def get_sequence_lengths(self, num_workers, cache_dir):
@@ -116,16 +105,10 @@ class VLMDataset(Dataset):
         torch.distributed.broadcast(md5_bytes, src=0)
 
         uid = bytes(md5_bytes.tolist()).hex()
-        cache_file = os.path.join(cache_dir, f"{uid}.pkl" )
+        cache_file = os.path.join(cache_dir, f"{uid}.pkl")
 
-        if cache_dir.startswith("oss://") and oss.object_exists(cache_file):
-            with oss.get_object(cache_file) as result:
-                buffer = io.BytesIO(result.read())
-                lengths = pickle.load(buffer)
-                buffer.close()
-            return lengths
-        elif os.path.exists(cache_file):
-            with open(cache_file, "rb") as f:
+        if storage.exists(cache_file):
+            with storage.open_file(cache_file, "rb") as f:
                 lengths = pickle.load(f)
             return lengths
 
@@ -160,67 +143,29 @@ class VLMDataset(Dataset):
         assert len(lengths) == len(self._dataset)
 
         if torch.distributed.get_rank() == 0:
-            if cache_dir.startswith("oss://"):
-                with io.BytesIO() as buffer:
-                    pickle.dump(lengths, buffer)
-                    buffer.seek(0)
-                    oss.put_object(cache_file, buffer)
-            else:
-                os.makedirs(cache_dir, exist_ok=True)
-                with open(cache_file, "wb") as f:
-                    pickle.dump(lengths, f)
+            with storage.open_file(cache_file, "wb") as f:
+                pickle.dump(lengths, f)
 
         return lengths
 
     def _load_data(self):
-        if self.data_mixture is not None:
-            assert self.data_path is None, "`data_path` and `data_mixture` cannot be used simultaneously."
-            with open(self.data_mixture, "r") as f:
-                data_mixture = json.load(f)
-            data_path = [x["data_path"] for x in data_mixture]
-            sampling_ratios = [x.get("sampling_ratio", 1.0) for x in data_mixture]
-        elif self.data_path is not None:
-            data_path = self.data_path
-            sampling_ratios = [1.0] * len(data_path)
+        if os.path.isdir(self.data_path):
+            dataset = load_from_disk(self.data_path)
         else:
-            raise ValueError
-
-        datasets = []
-        for path, sampling_ratio in zip(data_path, sampling_ratios):
-            if os.path.isdir(path):
-                dataset = load_from_disk(path)
-                assert sampling_ratio == 1.0
-                datasets.append(dataset)
-                continue
-
-            if path.endswith(".csv"):
+            if self.data_path.endswith(".csv"):
                 data_format = "csv"
-            elif path.endswith(".jsonl"):
+            elif self.data_path.endswith(".jsonl"):
                 data_format = "json"
-            elif path.endswith(".parquet"):
+            elif self.data_path.endswith(".parquet"):
                 data_format = "parquet"
-            elif path.endswith(".arrow"):
+            elif self.data_path.endswith(".arrow"):
                 data_format = "arrow"
-            elif path.endswith(".h5"):
+            elif self.data_path.endswith(".h5"):
                 data_format = "hdf5"
             else:
-                raise ValueError(f"Unsupported data format: {path}")
-
-            dataset = load_dataset(data_format, data_files=path)["train"]
-
-            if sampling_ratio < 1.0:
-                generator = torch.Generator(device="cuda")
-                generator.manual_seed(self.seed)
-                num_samples = round(len(dataset) * sampling_ratio)
-                sample_indices = torch.randperm(len(dataset), device="cuda", generator=generator)[:num_samples]
-                if torch.distributed.is_initialized():
-                    torch.distributed.broadcast(sample_indices, src=0)
-
-                dataset = dataset.select(sample_indices.cpu())
-
-            datasets.append(dataset)
-
-        return concatenate_datasets(datasets)
+                raise ValueError(f"Unsupported data format: {self.data_path}")
+            dataset = load_dataset(data_format, data_files=self.data_path)["train"]
+        return dataset
 
     def _convert_conversation(self, conversation: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         new_conversation = []
@@ -264,11 +209,6 @@ class VLMDataset(Dataset):
 
         assert model_inputs["input_ids"].size(-1) <= self.model_max_length, (
             f"Sequence length ({model_inputs['input_ids'].size(-1)}) exceeds model max length ({self.model_max_length})"
-        )
-
-        model_inputs["position_ids"] = get_rope_index(
-            model_config=self.model_config,
-            **model_inputs,
         )
 
         return model_inputs

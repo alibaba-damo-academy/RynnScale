@@ -1,244 +1,33 @@
-import gc
 import importlib
 import inspect
-import io
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Set
+from functools import reduce
+from typing import Any, Dict, Optional
 
 import torch
-from safetensors import safe_open
-from safetensors.torch import load
+from torch.distributed.tensor import distribute_tensor
 from tqdm import tqdm
 from transformers import (
     CONFIG_MAPPING,
     MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING,
     PROCESSOR_MAPPING,
-    AutoConfig,
-    AutoImageProcessor,
     AutoModel,
     AutoModelForImageTextToText,
-    AutoProcessor,
-    AutoTokenizer,
-    AutoVideoProcessor,
     PreTrainedModel,
 )
 from transformers.utils import (
     SAFE_WEIGHTS_INDEX_NAME,
     SAFE_WEIGHTS_NAME,
-    WEIGHTS_INDEX_NAME,
-    WEIGHTS_NAME,
     cached_file,
 )
 
 from .. import parallel_state as mpu
-from ..utils import logging, oss
+from ..utils import logging, storage
 
 logger = logging.get_logger(__name__)
-
-
-def _sync_expert_params(
-    expert_param_tags: Dict[str, int],
-    sharded_state_dict: Dict[str, torch.Tensor],
-    state_dict: Dict[str, torch.Tensor],
-):
-    ep_group = mpu.get_expert_model_parallel_group()
-    ep_world_size = mpu.get_expert_model_parallel_world_size()
-    ep_rank = mpu.get_expert_model_parallel_rank()
-
-    if ep_world_size == 1:
-        return
-
-    if ep_rank == 0:
-        sync_keys = [[key for key in sharded_state_dict if key in expert_param_tags]]
-    else:
-        sync_keys = [None]
-
-    torch.distributed.broadcast_object_list(
-        sync_keys,
-        group=ep_group,
-        group_src=0,
-    )
-
-    p2p_ops = []
-
-    for key in sync_keys[0]:
-        tag = expert_param_tags[key]
-        if ep_rank == 0:
-            tensor = sharded_state_dict[key].to(state_dict[key])
-            shared_tensors = tensor.chunk(ep_world_size, dim=0)
-            for dst_rank in range(1, ep_world_size):
-                logger.debug(
-                    f"Rank {ep_rank} (global rank {torch.distributed.get_rank()}), send {key}({shared_tensors[dst_rank].shape}) to rank {dst_rank}"
-                )
-                p2p_ops.append(
-                    torch.distributed.P2POp(
-                        torch.distributed.isend,
-                        shared_tensors[dst_rank].contiguous(),
-                        group=ep_group,
-                        tag=tag,
-                        group_peer=dst_rank,
-                    )
-                )
-            state_dict[key].copy_(shared_tensors[0], non_blocking=True)
-        else:
-            logger.debug(
-                f"Rank {ep_rank} (global rank {torch.distributed.get_rank()}), recv {key}({state_dict[key].shape}) from rank 0"
-            )
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv,
-                    state_dict[key],
-                    group=ep_group,
-                    tag=tag,
-                    group_peer=0,
-                )
-            )
-
-    if len(p2p_ops) > 0:
-        works = torch.distributed.batch_isend_irecv(p2p_ops)
-        for work in works:
-            work.wait()
-
-
-def _get_local_path(
-    pretrained_model_name_or_path: str,
-    filename: str,
-    _raise_exceptions_for_gated_repo: bool = True,
-    _raise_exceptions_for_missing_entries: bool = True,
-):
-    local_path = os.path.join(pretrained_model_name_or_path, filename)
-    if local_path.startswith("oss://"):
-        if oss.object_exists(local_path):
-            return local_path
-        return None
-    if os.path.exists(local_path):
-        return local_path
-    return cached_file(
-        pretrained_model_name_or_path,
-        filename=filename,
-        _raise_exceptions_for_gated_repo=_raise_exceptions_for_gated_repo,
-        _raise_exceptions_for_missing_entries=_raise_exceptions_for_missing_entries,
-    )
-
-
-def _load_checkpoint_file(
-    pretrained_model_name_or_path: str,
-    filename: str,
-    expert_param_tags: Dict[str, int],
-    state_dict: Dict[str, torch.Tensor],
-    missing_keys: Set[str],
-) -> None:
-    local_checkpoint_file = _get_local_path(
-        pretrained_model_name_or_path,
-        filename=filename,
-    )
-
-    if mpu.get_expert_model_parallel_rank() == 0:
-        if filename.endswith(".safetensors"):
-            if local_checkpoint_file.startswith("oss://"):
-                sharded_state_dict = load(oss.get_object(local_checkpoint_file).read())
-            else:
-                sharded_state_dict = {}
-                with safe_open(local_checkpoint_file, framework="pt", device="cpu") as f:
-                    for key in f.keys():
-                        sharded_state_dict[key] = f.get_tensor(key)
-        else:
-            if local_checkpoint_file.startswith("oss://"):
-                buffer = io.BytesIO(oss.get_object(local_checkpoint_file).read())
-                sharded_state_dict = torch.load(buffer, map_location="cpu")
-            else:
-                sharded_state_dict = torch.load(local_checkpoint_file, map_location="cpu")
-
-        for key, tensor in state_dict.items():
-            if key in sharded_state_dict:
-                missing_keys.discard(key)
-                if key not in expert_param_tags:
-                    tensor.copy_(sharded_state_dict[key], non_blocking=True)
-
-    else:
-        sharded_state_dict = None
-
-    _sync_expert_params(expert_param_tags, sharded_state_dict, state_dict)
-
-
-def _load_checkpoint_files(
-    pretrained_model_name_or_path: str,
-    expert_param_tags: Dict[str, int],
-    state_dict: Dict[str, torch.Tensor],
-) -> List[str]:
-    missing_keys = set(state_dict.keys())
-
-    checkpoint_file = _get_local_path(
-        pretrained_model_name_or_path,
-        filename=SAFE_WEIGHTS_NAME,
-        _raise_exceptions_for_gated_repo=False,
-        _raise_exceptions_for_missing_entries=False,
-    )
-
-    checkpoint_name = None
-    if checkpoint_file is not None:
-        checkpoint_name = SAFE_WEIGHTS_NAME
-    else:
-        checkpoint_file = _get_local_path(
-            pretrained_model_name_or_path,
-            filename=WEIGHTS_NAME,
-            _raise_exceptions_for_gated_repo=False,
-            _raise_exceptions_for_missing_entries=False,
-        )
-        if checkpoint_file is not None:
-            checkpoint_name = WEIGHTS_NAME
-
-    if checkpoint_name is not None:
-        _load_checkpoint_file(
-            pretrained_model_name_or_path,
-            filename=checkpoint_name,
-            expert_param_tags=expert_param_tags,
-            state_dict=state_dict,
-            missing_keys=missing_keys,
-        )
-        return list(missing_keys)
-
-    index_file = _get_local_path(
-        pretrained_model_name_or_path,
-        filename=SAFE_WEIGHTS_INDEX_NAME,
-        _raise_exceptions_for_gated_repo=False,
-        _raise_exceptions_for_missing_entries=False,
-    )
-
-    if index_file is None:
-        index_file = _get_local_path(
-            pretrained_model_name_or_path,
-            filename=WEIGHTS_INDEX_NAME,
-            _raise_exceptions_for_gated_repo=False,
-            _raise_exceptions_for_missing_entries=False,
-        )
-
-    assert index_file is not None
-
-    if SAFE_WEIGHTS_INDEX_NAME in index_file:
-        if index_file.startswith("oss://"):
-            weight_map = json.loads(oss.get_object(index_file).read())["weight_map"]
-        else:
-            with open(index_file, "r") as f:
-                weight_map = json.load(f)["weight_map"]
-    else:
-        raise NotImplementedError
-
-    for checkpoint_file in tqdm(
-        set(weight_map[key] for key in state_dict.keys() if key in weight_map),
-        desc="Loading checkpoint shards",
-    ):
-        _load_checkpoint_file(
-            pretrained_model_name_or_path,
-            filename=checkpoint_file,
-            expert_param_tags=expert_param_tags,
-            state_dict=state_dict,
-            missing_keys=missing_keys,
-        )
-
-    return list(missing_keys)
 
 
 @contextmanager
@@ -296,123 +85,287 @@ def _init_empty_params():
         restore_patch(torch.nn.Module)
 
 
-def _load_pretrained_weights(
-    model: PreTrainedModel,
-    state_dict: Dict[str, torch.Tensor],
+def _get_local_path(
     pretrained_model_name_or_path: str,
+    filename: str,
+    _raise_exceptions_for_gated_repo: bool = True,
+    _raise_exceptions_for_missing_entries: bool = True,
 ):
-    from ..utils.expert_parallel import BaseMoELayer
+    local_path = os.path.join(pretrained_model_name_or_path, filename)
+    if storage.exists(local_path):
+        return local_path
+    if storage.is_oss(local_path):
+        return None
+    return cached_file(
+        pretrained_model_name_or_path,
+        filename=filename,
+        _raise_exceptions_for_gated_repo=_raise_exceptions_for_gated_repo,
+        _raise_exceptions_for_missing_entries=_raise_exceptions_for_missing_entries,
+    )
 
-    expert_keys = set()
-    for module_name, module in model.named_modules():
-        if isinstance(module, BaseMoELayer):
-            for param_name, _ in module.named_parameters():
-                expert_keys.add(f"{module_name}.{param_name}")
 
-    if mpu.get_expert_data_parallel_rank() == 0:
-        expert_param_tags = {}
-        for i, key in enumerate(sorted(expert_keys)):
-            expert_param_tags[key] = i
+@torch.no_grad()
+def _init_missing_param(model: PreTrainedModel, param_name: str, tensor: torch.Tensor) -> None:
+    module_path, _, attr = param_name.rpartition(".")
 
-        if pretrained_model_name_or_path.startswith("oss://"):
-            original_config = oss.load_config(pretrained_model_name_or_path)
-        else:
-            original_config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
-        tie_word_embeddings = original_config.tie_word_embeddings
+    # Walk to the owning module, tracking the innermost enclosing `PreTrainedModel` on
+    # the way down the same way transformers' `smart_apply` dispatches: each sub-model
+    # brings its own `_init_weights` *and* its own config, so a vision tower must not
+    # inherit the LLM's `initializer_range`.
+    module = owner = model
+    for part in module_path.split(".") if module_path else []:
+        module = getattr(module, part)
+        if isinstance(module, PreTrainedModel):
+            owner = module
 
-        head_key = "lm_head.weight"
-        # TODO: handle embedding keys for general models
-        embedding_key = "model.language_model.embed_tokens.weight"
+    # Direct holder write because `setattr` rejects a plain tensor in a parameter
+    # slot; `nn.Parameter` shares storage, so writes reach `tensor`.
+    is_param = attr in module._parameters
+    holder = module._parameters if is_param else module._buffers
+    original = holder[attr]
+    holder[attr] = torch.nn.Parameter(tensor, requires_grad=original.requires_grad) if is_param else tensor
 
-        if mpu.get_data_parallel_rank() == 0 and tie_word_embeddings and head_key in state_dict and embedding_key not in state_dict:
-            state_dict[embedding_key] = state_dict[head_key].clone()
+    # Sentinel: a bare custom `nn.Parameter` matches no `_init_weights` branch and
+    # would otherwise keep the allocator's contents with no way to notice.
+    sentinel = tensor.is_floating_point()
+    tensor.fill_(float("nan") if sentinel else 0)
+    try:
+        owner._init_weights(module)
+    finally:
+        holder[attr] = original
 
-        missing_keys = _load_checkpoint_files(
-            pretrained_model_name_or_path,
-            expert_param_tags=expert_param_tags,
-            state_dict=state_dict,
+    if sentinel and tensor.isnan().any():
+        std = getattr(owner.config, "initializer_range", None)
+        if std is None:
+            std = getattr(owner.config.get_text_config(), "initializer_range", 0.02)
+        logger.warning(
+            f"'{param_name}' was not written by `{type(owner).__name__}._init_weights` "
+            f"(module `{type(module).__name__}`); falling back to normal_(0, {std}). "
+            f"Either no branch matches, or the branch copied instead of writing in place."
         )
-
-        state_dict_args = {}
-        if "convert" in inspect.signature(model.state_dict).parameters:
-            state_dict_args["convert"] = True
-        original_state_dict = model.state_dict(**state_dict_args)
-
-        if mpu.get_data_parallel_rank() == 0 and tie_word_embeddings and head_key in original_state_dict:
-            assert embedding_key not in missing_keys
-            assert head_key in missing_keys
-            missing_keys.remove(head_key)
-            state_dict[head_key].copy_(state_dict[embedding_key])
-            if embedding_key not in original_state_dict:
-                state_dict.pop(embedding_key)
-
-            logger.info(
-                f"Loaded checkpoint from '{pretrained_model_name_or_path}', missing keys: {missing_keys}"
-            )
+        tensor.normal_(mean=0.0, std=std)
 
 
+@torch.no_grad()
 def init_weights(
     model: PreTrainedModel,
     pretrained_model_name_or_path: Optional[str] = None,
+    num_workers: int = 4,
 ):
-    from ..utils.expert_parallel import BaseMoELayer
+    head_key = "lm_head.weight"
+    embedding_key = "model.language_model.embed_tokens.weight"
 
-    state_dict_args = {}
+    if pretrained_model_name_or_path is None:
+        weight_map = {}
+    else:
+        if torch.distributed.get_rank() == 0:
+            index_file = _get_local_path(
+                pretrained_model_name_or_path,
+                filename=SAFE_WEIGHTS_INDEX_NAME,
+                _raise_exceptions_for_gated_repo=False,
+                _raise_exceptions_for_missing_entries=False,
+            )
+            if index_file is not None:
+                with storage.open_file(index_file, "rb") as f:
+                    weight_map = json.load(f)["weight_map"]
+            else:
+                single_file = _get_local_path(
+                    pretrained_model_name_or_path,
+                    filename=SAFE_WEIGHTS_NAME,
+                    _raise_exceptions_for_gated_repo=False,
+                    _raise_exceptions_for_missing_entries=False,
+                )
+                assert single_file is not None, (
+                    f"Neither {SAFE_WEIGHTS_INDEX_NAME} nor {SAFE_WEIGHTS_NAME} "
+                    f"found for {pretrained_model_name_or_path}"
+                )
+                with storage.open_safetensors(single_file) as f:
+                    weight_map = {key: SAFE_WEIGHTS_NAME for key in f.keys()}
+        else:
+            weight_map = None
+
+        results = [weight_map]
+        torch.distributed.broadcast_object_list(results, src=0)
+        weight_map = results[0]
+
     if "convert" in inspect.signature(model.state_dict).parameters:
-        state_dict_args["convert"] = True
-    original_state_dict = model.state_dict(**state_dict_args)
+        meta_state_dict = model.state_dict(convert=True)
+    else:
+        meta_state_dict = model.state_dict()
 
-    # Ensuring continuous memory allocation
-    state_dict = {
-        key: torch.empty_like(tensor, memory_format=torch.contiguous_format, device="cuda")
-        for key, tensor in original_state_dict.items()
-    }
+    fsdp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+    fsdp_world_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
 
-    if pretrained_model_name_or_path is not None:
-        _load_pretrained_weights(
-            model,
-            state_dict=state_dict,
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
+    ep_world_size = mpu.get_expert_model_parallel_world_size()
+    expert_dp_rank = mpu.get_expert_data_parallel_rank()
+    expert_dp_world_size = mpu.get_expert_data_parallel_world_size()
+
+    param_names = list(meta_state_dict.keys())
+    if model.config.tie_word_embeddings and head_key in param_names:
+        param_names.remove(head_key)
+        if embedding_key not in param_names:
+            param_names.append(embedding_key)
+
+    def _is_expert_param(param):
+        mesh = getattr(param, "device_mesh", None)
+        if mesh is None or mesh.mesh_dim_names is None:
+            return False
+        return "ep" in mesh.mesh_dim_names
+
+    ep_src_range = max(min(expert_dp_world_size, ep_world_size), 1)
+
+    src_data_ranks = {}
+    non_expert_idx = 0
+    expert_idx = 0
+    for name in param_names:
+        if _is_expert_param(meta_state_dict[name]):
+            src_data_ranks[name] = expert_idx % ep_src_range
+            expert_idx += 1
+        else:
+            src_data_ranks[name] = non_expert_idx % fsdp_world_size
+            non_expert_idx += 1
+
+    local_param_names = []
+    for name in param_names:
+        src = src_data_ranks[name]
+        if _is_expert_param(meta_state_dict[name]):
+            if expert_dp_rank == src:
+                local_param_names.append(name)
+        else:
+            if fsdp_rank == src:
+                local_param_names.append(name)
+
+    def load_weight(param_name):
+        checkpoint_key = param_name
+        if checkpoint_key not in weight_map and model.base_model_prefix:
+            checkpoint_key = f"{model.base_model_prefix}.{param_name}"
+        if checkpoint_key not in weight_map:
+            return None
+        local_checkpoint_file = _get_local_path(
+            pretrained_model_name_or_path,
+            filename=weight_map[checkpoint_key],
         )
+        with storage.open_safetensors(local_checkpoint_file) as f:
+            return f.get_tensor(checkpoint_key)
 
-    state_dict_args = {"strict": True, "assign": True}
+    missing_keys = set(meta_state_dict.keys())
+    state_dict = {}
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {param_name: executor.submit(load_weight, param_name) for param_name in local_param_names}
+
+        for param_name in tqdm(param_names, desc="Init weights", disable=fsdp_rank != 0):
+            src_data_rank = src_data_ranks[param_name]
+            param = meta_state_dict[param_name]
+
+            if param_name in futures:
+                tensor = futures[param_name].result()
+                if tensor is None:
+                    tensor = torch.empty(param.shape, dtype=param.dtype, device="cuda")
+                    _init_missing_param(model, param_name, tensor)
+                else:
+                    tensor = tensor.to(dtype=param.dtype, device="cuda")
+                    missing_keys.remove(param_name)
+            else:
+                tensor = torch.empty(param.shape, dtype=param.dtype, device="cuda")
+
+            dtensor = distribute_tensor(
+                tensor,
+                device_mesh=param.device_mesh,
+                placements=param.placements,
+                src_data_rank=src_data_rank,
+            )
+            state_dict[param_name] = torch.nn.Parameter(dtensor)
+
+    if torch.distributed.get_rank() == 0:
+        all_missing_keys = [None] * torch.distributed.get_world_size()
+    else:
+        all_missing_keys = None
+
+    torch.distributed.gather_object(
+        obj=missing_keys,
+        object_gather_list=all_missing_keys,
+        dst=0,
+    )
+
+    if pretrained_model_name_or_path is not None and torch.distributed.get_rank() == 0:
+        missing_keys = reduce(set.intersection, all_missing_keys)
+        if model.config.tie_word_embeddings and head_key in meta_state_dict and embedding_key not in missing_keys:
+            missing_keys.remove(head_key)
+        if missing_keys:
+            logger.warning(
+                f"Loaded checkpoint from '{pretrained_model_name_or_path}', initialized missing keys: {missing_keys}"
+            )
+        else:
+            logger.info(f"Loaded checkpoint from '{pretrained_model_name_or_path}'")
+
+    if model.config.tie_word_embeddings and head_key in meta_state_dict:
+        state_dict[head_key] = state_dict[embedding_key]
+        if embedding_key not in meta_state_dict:
+            state_dict.pop(embedding_key)
+
     if "convert" in inspect.signature(model.load_state_dict).parameters:
-        state_dict_args["convert"] = True
-    model.load_state_dict(state_dict, **state_dict_args)
-
-    model.to("cuda")
-    model.tie_weights()
-
-    for module in model.modules():
-        if isinstance(module, BaseMoELayer):
-            module.mark_moe_parameters()
-
-    torch.distributed.barrier()
+        model.load_state_dict(state_dict, strict=True, assign=True, convert=True)
+    else:
+        model.load_state_dict(state_dict, strict=True, assign=True)
 
     return model
+
+
+def _infer_model_type(
+    model_path: str,
+    model_type: Optional[str] = None,
+):
+    if model_type is not None:
+        return model_type
+
+    # Read the raw JSON rather than going through AutoConfig: a custom model type
+    # is absent from transformers' CONFIG_MAPPING until the model package's
+    # apply_monkey_patch() registers it, and that cannot run before we know which
+    # package to import.
+    with storage.open_file(os.path.join(model_path, "config.json")) as f:
+        return json.loads(f.read())["model_type"]
+
+
+def build_processor(
+    model_type: Optional[str],
+    model_path: str,
+    processor_overrides: Optional[Dict[str, Any]] = None,
+):
+    processor_overrides = processor_overrides or {}
+    model_type = _infer_model_type(model_path=model_path, model_type=model_type)
+
+    module = importlib.import_module(f".{model_type}", package=__package__)
+    assert hasattr(module, "apply_monkey_patch")
+    logger.info(f"Apply monkey patch for `{model_type}` using {module.apply_monkey_patch}")
+    module.apply_monkey_patch()
+
+    processor_class = PROCESSOR_MAPPING[CONFIG_MAPPING[model_type]]
+    return storage.load_processor(
+        model_path,
+        processor_class=processor_class,
+        **processor_overrides,
+    )
 
 
 def build_model(
     model_type: str,
     model_path: str,
-    dtype: torch.dtype,
+    param_dtype: torch.dtype,
     attn_implementation: str,
+    config_overrides: Optional[Dict[str, Any]] = None,
     vision_encoder_path: Optional[str] = None,
     reduced_layers_in_stage_zero: int = 0,
+    reshard_after_forward: bool = False,
+    master_param_dtype: torch.dtype = torch.float32,
+    reduce_dtype: torch.dtype = torch.float32,
+    processor: Optional[Any] = None,
 ):
-    if model_path.startswith("oss://"):
-        original_config = oss.load_config(model_path)
-    else:
-        original_config = AutoConfig.from_pretrained(model_path)
+    config_overrides = config_overrides or {}
 
-    if type(original_config) not in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING:
-        assert model_type is not None
-
-    tie_word_embeddings = original_config.tie_word_embeddings
-    if mpu.get_pipeline_model_parallel_world_size() > 1:
-        tie_word_embeddings = False
-    original_config.tie_word_embeddings = tie_word_embeddings
-    original_config.get_text_config().tie_word_embeddings = tie_word_embeddings
+    # Resolve the model type and register the package before touching the config:
+    # apply_monkey_patch() is what puts custom types into CONFIG_MAPPING.
+    model_type = _infer_model_type(model_path=model_path, model_type=model_type)
 
     module_dir = os.path.join(os.path.dirname(__file__), model_type)
     assert os.path.isdir(module_dir)
@@ -421,15 +374,22 @@ def build_model(
     logger.info(f"Apply monkey patch for `{model_type}` using {module.apply_monkey_patch}")
     module.apply_monkey_patch()
 
-    if model_path.startswith("oss://"):
-        processor = oss.load_processor(model_path)
-    else:
-        processor = AutoProcessor.from_pretrained(model_path)
+    config = storage.load_config(model_path, model_type=model_type, **config_overrides)
+
+    if processor is None:
+        processor = storage.load_processor(model_path)
     with _init_empty_params():
-        model = AutoModelForImageTextToText.from_config(
-            config=original_config,
-            dtype=dtype,
+        if type(config) in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING:
+            auto_class = AutoModelForImageTextToText
+        else:
+            # Model packages that register into MODEL_MAPPING instead of the
+            # image-text-to-text mapping (e.g. rynn_brain_vla) are reachable
+            # only through AutoModel.
+            auto_class = AutoModel
+        model = auto_class.from_config(
+            config=config,
             attn_implementation=attn_implementation,
+            dtype=master_param_dtype,
         )
 
     pp_world_size = mpu.get_pipeline_model_parallel_world_size()
@@ -444,13 +404,22 @@ def build_model(
         )
 
     ep_world_size = mpu.get_expert_model_parallel_world_size()
-    ep_rank = mpu.get_expert_model_parallel_rank()
 
     if ep_world_size > 1:
         assert hasattr(model, "apply_expert_parallel")
         model.apply_expert_parallel(
-            ep_world_size=ep_world_size,
-            ep_rank=ep_rank,
+            expert_device_mesh=mpu.get_expert_device_mesh(),
         )
+
+    model.apply_fully_sharded_data_parallel(
+        device_mesh=mpu.get_device_mesh(),
+        expert_device_mesh=mpu.get_expert_device_mesh(),
+        mp_policy=torch.distributed.fsdp.MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            cast_forward_inputs=False,
+        ),
+        reshard_after_forward=reshard_after_forward,
+    )
 
     return model, processor

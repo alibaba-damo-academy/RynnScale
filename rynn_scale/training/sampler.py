@@ -134,7 +134,9 @@ class DistributedBatchSampler(DistributedSampler):
                     batch_indices = self._longest_first_partition(all_sample_indices)
                     yield batch_indices[self.rank]
                 else:
-                    yield global_batch_indices[self.rank][i][j * self.micro_batch_size : (j + 1) * self.micro_batch_size]
+                    yield global_batch_indices[self.rank][i][
+                        j * self.micro_batch_size : (j + 1) * self.micro_batch_size
+                    ]
 
     def __len__(self) -> int:
         return self.num_batches * self.gradient_accumulation_steps

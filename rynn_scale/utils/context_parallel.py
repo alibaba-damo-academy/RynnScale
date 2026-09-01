@@ -3,13 +3,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from flash_attn.flash_attn_interface import (
-    _flash_attn_varlen_forward,
     _flash_attn_varlen_backward,
+    _flash_attn_varlen_forward,
 )
 
-from . import logging
 from .. import parallel_state as mpu
 from ..ops import all_to_all
+from . import logging
 
 logger = logging.get_logger(__name__)
 
@@ -27,10 +27,7 @@ class _GatherSequenceFunction(torch.autograd.Function):
         rank = torch.distributed.get_rank(group)
 
         if sizes is None:
-            outputs = [
-                tensor if i == rank else torch.empty_like(tensor)
-                for i in range(world_size)
-            ]
+            outputs = [tensor if i == rank else torch.empty_like(tensor) for i in range(world_size)]
         else:
             assert len(sizes) == world_size
             outputs = []
@@ -95,7 +92,9 @@ class EncoderContextDispatcher(object):
         num_tokens = grid_thw[:, 1:].prod(dim=1).repeat_interleave(grid_thw[:, 0])
 
         if self.cp_size > 1 and len(num_tokens) < self.cp_size:
-            logger.warning(f"Number of frames ({len(num_tokens)}) < context parallel size ({self.cp_size}). This will lead to redundant calculations and a decrease in speed.")
+            logger.warning(
+                f"Number of frames ({len(num_tokens)}) < context parallel size ({self.cp_size}). This will lead to redundant calculations and a decrease in speed."
+            )
 
         if self.cp_size > 1 and len(num_tokens) >= self.cp_size:
             src_group_ids = [self.cp_rank] * len(num_tokens)
@@ -441,15 +440,22 @@ class _RingAttnVarlenFunc(torch.autograd.Function):
         if max_seqlen_k_half is None:
             max_seqlen_k_half = max_seqlen_k // 2
         if q_second_half_indices is None:
-            q_second_half_indices = torch.cat([
-                torch.arange(cu_seqlens_q[i], cu_seqlens_q[i + 1], device=q.device, dtype=torch.long)
-                for i in range(len(cu_seqlens_q) - 1)
-            ]) + cu_seqlens_q[:-1]
+            q_second_half_indices = (
+                torch.cat(
+                    [
+                        torch.arange(cu_seqlens_q[i], cu_seqlens_q[i + 1], device=q.device, dtype=torch.long)
+                        for i in range(len(cu_seqlens_q) - 1)
+                    ]
+                )
+                + cu_seqlens_q[:-1]
+            )
         if k_first_half_indices is None:
-            k_first_half_indices = torch.cat([
-                torch.arange(cu_seqlens_k[i], cu_seqlens_k[i + 1], device=k.device, dtype=torch.long)
-                for i in range(len(cu_seqlens_k) - 1)
-            ])
+            k_first_half_indices = torch.cat(
+                [
+                    torch.arange(cu_seqlens_k[i], cu_seqlens_k[i + 1], device=k.device, dtype=torch.long)
+                    for i in range(len(cu_seqlens_k) - 1)
+                ]
+            )
 
         world_size = torch.distributed.get_world_size(group)
         rank = torch.distributed.get_rank(group)
@@ -519,7 +525,19 @@ class _RingAttnVarlenFunc(torch.autograd.Function):
         output = output.to(q.dtype)
         lse = lse.transpose(0, 1).squeeze(dim=-1)
 
-        ctx.save_for_backward(q, k_local, v_local, output, lse, cu_seqlens_q, cu_seqlens_k, q_second_half_indices, k_first_half_indices, cu_seqlens_q_half, cu_seqlens_k_half)
+        ctx.save_for_backward(
+            q,
+            k_local,
+            v_local,
+            output,
+            lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            q_second_half_indices,
+            k_first_half_indices,
+            cu_seqlens_q_half,
+            cu_seqlens_k_half,
+        )
         ctx.group = group
         ctx.world_size = world_size
         ctx.rank = rank
@@ -537,7 +555,19 @@ class _RingAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
 
-        q, k_local, v_local, output, lse, cu_seqlens_q, cu_seqlens_k, q_second_half_indices, k_first_half_indices, cu_seqlens_q_half, cu_seqlens_k_half = ctx.saved_tensors
+        (
+            q,
+            k_local,
+            v_local,
+            output,
+            lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            q_second_half_indices,
+            k_first_half_indices,
+            cu_seqlens_q_half,
+            cu_seqlens_k_half,
+        ) = ctx.saved_tensors
 
         k, v = torch.empty_like(k_local), torch.empty_like(v_local)
         k_recv, v_recv = k_local.clone(), v_local.clone()
@@ -597,8 +627,8 @@ class _RingAttnVarlenFunc(torch.autograd.Function):
                     out=output,
                     softmax_lse=lse,
                     dq=dq_tmp,
-                    dk=dk_tmp[:k.size(0) // 2],
-                    dv=dv_tmp[:k.size(0) // 2],
+                    dk=dk_tmp[: k.size(0) // 2],
+                    dv=dv_tmp[: k.size(0) // 2],
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k=cu_seqlens_k_half,
                     max_seqlen_q=ctx.max_seqlen_q,
@@ -613,7 +643,7 @@ class _RingAttnVarlenFunc(torch.autograd.Function):
                     deterministic=False,
                 )
                 block_dq = dq_tmp
-                block_dk, block_dv = dk_tmp[:k.size(0) // 2], dv_tmp[:k.size(0) // 2]
+                block_dk, block_dv = dk_tmp[: k.size(0) // 2], dv_tmp[: k.size(0) // 2]
             else:
                 _flash_attn_varlen_backward(
                     dout=grad_output[q_second_half_indices],
@@ -622,7 +652,7 @@ class _RingAttnVarlenFunc(torch.autograd.Function):
                     v=v,
                     out=output[q_second_half_indices],
                     softmax_lse=lse[:, q_second_half_indices],
-                    dq=dq_tmp[:q.size(0) // 2],
+                    dq=dq_tmp[: q.size(0) // 2],
                     dk=dk_tmp,
                     dv=dv_tmp,
                     cu_seqlens_q=cu_seqlens_q_half,
@@ -638,11 +668,13 @@ class _RingAttnVarlenFunc(torch.autograd.Function):
                     alibi_slopes=None,
                     deterministic=False,
                 )
-                block_dq = dq_tmp[:q.size(0) // 2]
+                block_dq = dq_tmp[: q.size(0) // 2]
                 block_dk, block_dv = dk_tmp, dv_tmp
 
             dk, dv, dk_recv, dv_recv = _wait(dk, dv, dk_recv, dv_recv, grad_works)
-            dq, dk, dv = _update_grad(dq, dk, dv, block_dq, block_dk, block_dv, q_second_half_indices, k_first_half_indices)
+            dq, dk, dv = _update_grad(
+                dq, dk, dv, block_dq, block_dk, block_dv, q_second_half_indices, k_first_half_indices
+            )
             _batch_isend_irecv(dk, dv, dk_recv, dv_recv, ctx.recv_rank, ctx.send_rank, ctx.group, grad_works)
 
         dk, dv, dk_recv, dv_recv = _wait(dk, dv, dk_recv, dv_recv, grad_works)

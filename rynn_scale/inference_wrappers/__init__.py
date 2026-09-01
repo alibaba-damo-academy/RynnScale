@@ -3,11 +3,12 @@ from typing import Any, Dict, Optional
 import torch
 
 from ..registry import INFERENCE_WRAPPER_REGISTRY
-from .base import BaseInferenceWrapper
-from .qwen3_vl import Qwen3VLInferenceWrapper
-from .qwen3_vl_moe import Qwen3VLMoeInferenceWrapper
+from .base import BaseInferenceWrapper, BaseVLAInferenceWrapper, BaseVLMInferenceWrapper
 from .qwen3_5 import Qwen3_5InferenceWrapper
 from .qwen3_5_moe import Qwen3_5MoeInferenceWrapper
+from .qwen3_vl import Qwen3VLInferenceWrapper
+from .qwen3_vl_moe import Qwen3VLMoeInferenceWrapper
+from .rynn_brain_vla import RynnBrainVLAInferenceWrapper
 
 
 def build_inference_wrapper(

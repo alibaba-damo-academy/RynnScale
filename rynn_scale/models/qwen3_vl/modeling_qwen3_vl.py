@@ -5,33 +5,47 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
+from torch.distributed.fsdp import fully_shard
 from torch.utils.checkpoint import checkpoint
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import ModelOutput
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     BaseModelOutputWithDeepstackFeatures,
     BaseModelOutputWithPast,
-    Qwen3VLForConditionalGeneration,
-    Qwen3VLModel,
     Qwen3VLModelOutputWithPast,
     Qwen3VLTextDecoderLayer,
-    Qwen3VLTextModel,
-    Qwen3VLTextRMSNorm,
     Qwen3VLTextRotaryEmbedding,
-    Qwen3VLVisionModel,
     create_causal_mask,
-    Qwen3VLTextAttention,
-    apply_rotary_pos_emb,
     eager_attention_forward,
 )
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLForConditionalGeneration as _Qwen3VLForConditionalGeneration,
+)
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLModel as _Qwen3VLModel,
+)
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLTextAttention as _Qwen3VLTextAttention,
+)
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLTextModel as _Qwen3VLTextModel,
+)
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLTextRMSNorm as _Qwen3VLTextRMSNorm,
+)
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLVisionModel as _Qwen3VLVisionModel,
+)
 from transformers.processing_utils import Unpack
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
+from ...ops.norm import rms_norm
+from ...ops.rope import apply_rope
 from ...utils import context_parallel
 
 
@@ -46,7 +60,13 @@ class Qwen3VLCausalLMOutputWithPast(ModelOutput):
     rope_deltas: Optional[torch.LongTensor] = None
 
 
-class _Qwen3VLVisionModel(Qwen3VLVisionModel):
+def apply_rotary_pos_emb_vision(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return apply_rope(q.contiguous(), k.contiguous(), cos, sin, inplace=True)
+
+
+class Qwen3VLVisionModel(_Qwen3VLVisionModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gradient_checkpointing_interval = None
@@ -82,8 +102,7 @@ class _Qwen3VLVisionModel(Qwen3VLVisionModel):
         hidden_states = dispatcher.dispatch(hidden_states)
         rotary_pos_emb = dispatcher.dispatch(rotary_pos_emb)
 
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        position_embeddings = (rotary_pos_emb.cos(), rotary_pos_emb.sin())
 
         if dispatcher.cu_seqlens is not None:
             cu_seqlens = grid_thw.new_tensor(dispatcher.cu_seqlens, dtype=torch.int32)
@@ -189,7 +208,7 @@ class _Qwen3VLVisionModel(Qwen3VLVisionModel):
         return flops
 
 
-class _Qwen3VLTextAttention(Qwen3VLTextAttention):
+class Qwen3VLTextAttention(_Qwen3VLTextAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -207,15 +226,19 @@ class _Qwen3VLTextAttention(Qwen3VLTextAttention):
         value_states = self.v_proj(hidden_states).view(hidden_shape)
 
         query_states, key_states, value_states = context_parallel.ulysses_preprocess(
-            query_states, key_states, value_states,
+            query_states,
+            key_states,
+            value_states,
         )
+
+        cos, sin = position_embeddings
+        cos = cos[..., : cos.shape[-1] // 2]
+        sin = sin[..., : sin.shape[-1] // 2]
+        query_states, key_states = apply_rope(query_states, key_states, cos, sin, inplace=True)
 
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -243,19 +266,14 @@ class _Qwen3VLTextAttention(Qwen3VLTextAttention):
         return attn_output, attn_weights
 
 
-class _Qwen3VLTextRMSNorm(Qwen3VLTextRMSNorm):
+class Qwen3VLTextRMSNorm(_Qwen3VLTextRMSNorm):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return F.rms_norm(
-            hidden_states,
-            normalized_shape=[hidden_states.size(-1)],
-            weight=self.weight,
-            eps=self.variance_epsilon,
-        )
+        return rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
 
-class _Qwen3VLTextModel(Qwen3VLTextModel):
+class Qwen3VLTextModel(_Qwen3VLTextModel):
     def __init__(self, config):
-        super(Qwen3VLTextModel, self).__init__(config)
+        super(_Qwen3VLTextModel, self).__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -266,7 +284,7 @@ class _Qwen3VLTextModel(Qwen3VLTextModel):
                 for layer_idx in range(config.num_hidden_layers)
             }
         )
-        self.norm = _Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -399,7 +417,7 @@ class _Qwen3VLTextModel(Qwen3VLTextModel):
         return flops
 
 
-class _Qwen3VLModel(Qwen3VLModel):
+class Qwen3VLModel(_Qwen3VLModel):
     def get_multimodal_features(
         self,
         pixel_values: Optional[torch.Tensor] = None,
@@ -417,9 +435,7 @@ class _Qwen3VLModel(Qwen3VLModel):
             image_grid_thw = torch.zeros((0, 3), dtype=torch.long, device=self.visual.device)
 
         if pixel_values_videos is None:
-            pixel_values_videos = torch.zeros(
-                0, patch_channels, dtype=self.visual.dtype, device=self.visual.device
-            )
+            pixel_values_videos = torch.zeros(0, patch_channels, dtype=self.visual.dtype, device=self.visual.device)
             video_grid_thw = torch.zeros((0, 3), dtype=torch.long, device=self.visual.device)
 
         pixel_values = torch.cat([pixel_values, pixel_values_videos], dim=0).type(self.visual.dtype)
@@ -478,7 +494,8 @@ class _Qwen3VLModel(Qwen3VLModel):
 
         if inputs_embeds is None:
             sequence_splitter, kwargs = context_parallel.get_sequence_splitter(
-                input_ids.size(1), attn_kwargs=kwargs,
+                input_ids.size(1),
+                attn_kwargs=kwargs,
             )
             inputs_embeds = self.get_input_embeddings()(input_ids[:, sequence_splitter])
         else:
@@ -582,7 +599,6 @@ class _Qwen3VLModel(Qwen3VLModel):
     ):
         num_layers = len(self.language_model.layers)
         assert (num_layers + reduced_layers_in_stage_zero) % num_stages == 0
-        assert not self.config.text_config.tie_word_embeddings
 
         num_local_layers = [
             (num_layers + reduced_layers_in_stage_zero) // num_stages - reduced_layers_in_stage_zero
@@ -604,13 +620,44 @@ class _Qwen3VLModel(Qwen3VLModel):
                 del self.language_model.layers[str(layer_idx)]
 
         if stage_index > 0:
-            del self.visual, self.language_model.embed_tokens
+            del self.visual
+            tied = self.config.text_config.tie_word_embeddings
+            mtp_enabled = getattr(self.config, "mtp_loss_weight", 0) > 0
+            keep_embed_on_last = (stage_index == num_stages - 1) and (tied or mtp_enabled)
+            if not keep_embed_on_last:
+                del self.language_model.embed_tokens
 
         if stage_index < num_stages - 1:
             del self.language_model.norm
 
+    def apply_fully_sharded_data_parallel(
+        self,
+        device_mesh: torch.distributed.DeviceMesh,
+        expert_device_mesh: torch.distributed.DeviceMesh,
+        mp_policy: torch.distributed.fsdp.MixedPrecisionPolicy,
+        reshard_after_forward: bool = False,
+    ):
+        fsdp_config = {
+            "reshard_after_forward": reshard_after_forward,
+            "mp_policy": mp_policy,
+        }
 
-class _Qwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
+        if hasattr(self, "visual"):
+            fully_shard(self.visual, mesh=device_mesh["dp"], **fsdp_config)
+
+        if hasattr(self.language_model, "embed_tokens"):
+            fully_shard(self.language_model.embed_tokens, mesh=device_mesh["dp"], **fsdp_config)
+
+        for layer_id, layer in self.language_model.layers.items():
+            fully_shard(layer, mesh=device_mesh["dp"], **fsdp_config)
+
+        if hasattr(self.language_model, "norm"):
+            fully_shard(self.language_model.norm, mesh=device_mesh["dp"], **fsdp_config)
+
+        fully_shard(self, mesh=device_mesh["dp"], **fsdp_config)
+
+
+class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
     accepts_loss_kwargs = True
 
     @can_return_tuple
@@ -650,12 +697,13 @@ class _Qwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if hasattr(self, "lm_head"):
             if labels is not None:
                 sequence_splitter, _ = context_parallel.get_sequence_splitter(
-                    labels.size(1), attn_kwargs=kwargs,
+                    labels.size(1),
+                    attn_kwargs=kwargs,
                 )
                 loss = self.loss_function(
                     hidden_states=hidden_states,
                     lm_head=self.lm_head,
-                    position_ids=position_ids,
+                    cu_seq_lens=kwargs["cu_seq_lens_q"],
                     labels=labels,
                     num_items_in_batch=kwargs["num_items_in_batch"],
                     sequence_splitter=sequence_splitter,
@@ -691,17 +739,53 @@ class _Qwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if stage_index < num_stages - 1:
             del self.lm_head
 
+    def apply_fully_sharded_data_parallel(
+        self,
+        device_mesh: torch.distributed.DeviceMesh,
+        expert_device_mesh: torch.distributed.DeviceMesh,
+        mp_policy: torch.distributed.fsdp.MixedPrecisionPolicy,
+        reshard_after_forward: bool = False,
+    ):
+        fsdp_config = {
+            "reshard_after_forward": reshard_after_forward,
+            "mp_policy": mp_policy,
+        }
+
+        if hasattr(self.model, "visual"):
+            fully_shard(self.model.visual, mesh=device_mesh["dp"], **fsdp_config)
+
+        if hasattr(self.model.language_model, "embed_tokens"):
+            if self.config.tie_word_embeddings and hasattr(self, "lm_head"):
+                fully_shard(
+                    [self.model.language_model.embed_tokens, self.lm_head],
+                    mesh=device_mesh["dp"],
+                    **fsdp_config,
+                )
+            else:
+                fully_shard(self.model.language_model.embed_tokens, mesh=device_mesh["dp"], **fsdp_config)
+                if hasattr(self, "lm_head"):
+                    fully_shard(self.lm_head, mesh=device_mesh["dp"], **fsdp_config)
+
+        for layer_id, layer in self.model.language_model.layers.items():
+            fully_shard(layer, mesh=device_mesh["dp"], **fsdp_config)
+
+        if hasattr(self.model.language_model, "norm"):
+            fully_shard(self.model.language_model.norm, mesh=device_mesh["dp"], **fsdp_config)
+
+        fully_shard(self, mesh=device_mesh["dp"], **fsdp_config)
+
 
 def apply_monkey_patch():
-    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLVisionModel = _Qwen3VLVisionModel
-    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLTextAttention = _Qwen3VLTextAttention
-    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLTextRMSNorm = _Qwen3VLTextRMSNorm
-    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLTextModel = _Qwen3VLTextModel
+    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLVisionModel = Qwen3VLVisionModel
+    transformers.models.qwen3_vl.modeling_qwen3_vl.apply_rotary_pos_emb_vision = apply_rotary_pos_emb_vision
+    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLTextAttention = Qwen3VLTextAttention
+    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLTextRMSNorm = Qwen3VLTextRMSNorm
+    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLTextModel = Qwen3VLTextModel
 
-    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLModel = _Qwen3VLModel
-    transformers.models.auto.modeling_auto.MODEL_MAPPING[Qwen3VLConfig] = _Qwen3VLModel
+    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLModel = Qwen3VLModel
+    transformers.models.auto.modeling_auto.MODEL_MAPPING[Qwen3VLConfig] = Qwen3VLModel
 
-    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLForConditionalGeneration = _Qwen3VLForConditionalGeneration
+    transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLForConditionalGeneration = Qwen3VLForConditionalGeneration
     transformers.models.auto.modeling_auto.MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING[Qwen3VLConfig] = (
-        _Qwen3VLForConditionalGeneration
+        Qwen3VLForConditionalGeneration
     )

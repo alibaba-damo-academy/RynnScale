@@ -5,7 +5,9 @@ import torch
 import transformers
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
 from transformers.models.qwen3_vl.processing_qwen3_vl import (
-    Qwen3VLProcessor,
+    Qwen3VLProcessor as _Qwen3VLProcessor,
+)
+from transformers.models.qwen3_vl.processing_qwen3_vl import (
     Qwen3VLProcessorKwargs,
 )
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import smart_resize
@@ -14,7 +16,131 @@ from transformers.processing_utils import AllKwargsForChatTemplate, MultiModalDa
 from ...utils.processing import load_multimodal_data
 
 
-class _Qwen3VLProcessor(Qwen3VLProcessor):
+def _get_rope_index_qwen3_vl(
+    input_ids: torch.LongTensor,
+    image_grid_thw: Optional[torch.LongTensor] = None,
+    video_grid_thw: Optional[torch.LongTensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    *,
+    image_spatial_merge_size: int,
+    video_spatial_merge_size: int,
+    image_token_id: int,
+    video_token_id: int,
+    vision_start_token_id: int,
+    **kwargs,
+) -> torch.Tensor:
+    """Different from the original implementation, Qwen3VL use timestamps rather than absolute time position ids."""
+
+    # Since we use timestamps to seperate videos, like <t1> <vision_start> <frame1> <vision_end> <t2> <vision_start> <frame2> <vision_end>, the video_grid_thw should also be split
+    if video_grid_thw is not None:
+        video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+        video_grid_thw[:, 0] = 1
+
+    mrope_position_deltas = []
+    if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
+        total_input_ids = input_ids
+        if attention_mask is None:
+            attention_mask = torch.ones_like(total_input_ids)
+        position_ids = torch.ones(
+            3,
+            input_ids.shape[0],
+            input_ids.shape[1],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        image_index, video_index = 0, 0
+        attention_mask = attention_mask.to(total_input_ids.device)
+        for i, input_ids in enumerate(total_input_ids):
+            input_ids = input_ids[attention_mask[i] == 1]
+            image_nums, video_nums = 0, 0
+            vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
+            vision_tokens = input_ids[vision_start_indices + 1]
+            image_nums = (vision_tokens == image_token_id).sum()
+            video_nums = (vision_tokens == video_token_id).sum()
+            input_tokens = input_ids.tolist()
+            llm_pos_ids_list: list = []
+            st = 0
+            remain_images, remain_videos = image_nums, video_nums
+            for _ in range(image_nums + video_nums):
+                if image_token_id in input_tokens and remain_images > 0:
+                    ed_image = input_tokens.index(image_token_id, st)
+                else:
+                    ed_image = len(input_tokens) + 1
+                if video_token_id in input_tokens and remain_videos > 0:
+                    ed_video = input_tokens.index(video_token_id, st)
+                else:
+                    ed_video = len(input_tokens) + 1
+                if ed_image < ed_video:
+                    t, h, w = (
+                        image_grid_thw[image_index][0],
+                        image_grid_thw[image_index][1],
+                        image_grid_thw[image_index][2],
+                    )
+                    spatial_merge_size = image_spatial_merge_size
+                    image_index += 1
+                    remain_images -= 1
+                    ed = ed_image
+
+                else:
+                    t, h, w = (
+                        video_grid_thw[video_index][0],
+                        video_grid_thw[video_index][1],
+                        video_grid_thw[video_index][2],
+                    )
+                    spatial_merge_size = video_spatial_merge_size
+                    video_index += 1
+                    remain_videos -= 1
+                    ed = ed_video
+                llm_grid_t, llm_grid_h, llm_grid_w = (
+                    t.item(),
+                    h.item() // spatial_merge_size,
+                    w.item() // spatial_merge_size,
+                )
+                text_len = ed - st
+
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+                # t_index is always 0 because llm_grid_t is always 1 (we use timestamps to encode the temporal information for videos)
+                t_index = torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
+                h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
+                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+
+            if st < len(input_tokens):
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
+            mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+        mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+        return position_ids
+    else:
+        if attention_mask is not None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
+            max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
+            mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+        else:
+            position_ids = (
+                torch.arange(input_ids.shape[1], device=input_ids.device)
+                .view(1, 1, -1)
+                .expand(3, input_ids.shape[0], -1)
+            )
+            mrope_position_deltas = torch.zeros(
+                [input_ids.shape[0], 1],
+                device=input_ids.device,
+                dtype=input_ids.dtype,
+            )
+
+        return position_ids
+
+
+class Qwen3VLProcessor(_Qwen3VLProcessor):
     def apply_chat_template(
         self,
         conversation: List[Dict[str, str]],
@@ -25,8 +151,16 @@ class _Qwen3VLProcessor(Qwen3VLProcessor):
         return_labels: bool = False,
         **kwargs: Unpack[AllKwargsForChatTemplate],
     ):
+        # `size`/`max_pixels` are image-processing kwargs, not chat-template variables. As of
+        # transformers 5.x, `apply_chat_template` requires these to be passed via the dedicated
+        # `processor_kwargs` dict; forwarding them through `**kwargs` triggers a warning.
+        processor_kwargs = dict(kwargs.pop("processor_kwargs", None) or {})
+        for key in ("size", "max_pixels"):
+            if key in kwargs:
+                processor_kwargs[key] = kwargs.pop(key)
+
         if mm_max_length is not None:
-            assert "max_pixels" not in kwargs and "size" not in kwargs, (
+            assert "max_pixels" not in processor_kwargs and "size" not in processor_kwargs, (
                 "Please provide only one of `mm_max_length` and `max_pixels`."
             )
             num_images, num_videos = 0, 0
@@ -36,7 +170,7 @@ class _Qwen3VLProcessor(Qwen3VLProcessor):
                         num_images += 1
                     elif content["type"] == "video":
                         num_videos += 1
-            kwargs["size"] = {
+            processor_kwargs["size"] = {
                 # FIXME: add an argument to control `shortest_edge`
                 "shortest_edge": self.image_processor.size["shortest_edge"],
                 "longest_edge": self._get_max_pixels(
@@ -50,6 +184,7 @@ class _Qwen3VLProcessor(Qwen3VLProcessor):
             return super().apply_chat_template(
                 conversation,
                 chat_template=chat_template,
+                processor_kwargs=processor_kwargs,
                 **kwargs,
             )
 
@@ -61,13 +196,16 @@ class _Qwen3VLProcessor(Qwen3VLProcessor):
         )
         assert kwargs.pop("tokenize", True), "`tokenize` must be set to True when `return_labels` is True."
         assert kwargs.pop("return_dict", False), "`return_dict` must be set to True when `return_labels` is True."
-        assert kwargs.pop("do_sample_frames", True), "`do_sample_frames` must be set to True when `return_labels` is True."
+        assert kwargs.pop("do_sample_frames", True), (
+            "`do_sample_frames` must be set to True when `return_labels` is True."
+        )
 
         prompt = super().apply_chat_template(
             conversation,
             chat_template=chat_template,
             add_generation_prompt=False,
             tokenize=False,
+            processor_kwargs=processor_kwargs,
             **kwargs,
         )
 
@@ -84,6 +222,7 @@ class _Qwen3VLProcessor(Qwen3VLProcessor):
             video_metadata=video_metadatas,
             do_sample_frames=False,
             return_tensors="pt",
+            **processor_kwargs,
             **kwargs,
         )
 
@@ -118,11 +257,25 @@ class _Qwen3VLProcessor(Qwen3VLProcessor):
                             break
                     else:
                         raise ValueError("No generation prompt found in assistant message.")
-                    labels[start_idx:end_idx + 1] = input_ids[start_idx:end_idx + 1]
+                    labels[start_idx : end_idx + 1] = input_ids[start_idx : end_idx + 1]
 
             batch_labels.append(labels)
 
         model_inputs["labels"] = torch.stack(batch_labels, dim=0)
+
+        # Qwen3VL uses timestamp-based mrope position ids, which depend on the tokenized
+        # multimodal layout produced above, so compute them here in the processor.
+        model_inputs["position_ids"] = _get_rope_index_qwen3_vl(
+            input_ids=model_inputs["input_ids"],
+            image_grid_thw=model_inputs.get("image_grid_thw"),
+            video_grid_thw=model_inputs.get("video_grid_thw"),
+            attention_mask=model_inputs.get("attention_mask"),
+            image_spatial_merge_size=self.image_processor.merge_size,
+            video_spatial_merge_size=self.video_processor.merge_size,
+            image_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+        )
 
         return model_inputs
 
@@ -214,5 +367,5 @@ class _Qwen3VLProcessor(Qwen3VLProcessor):
 
 
 def apply_monkey_patch():
-    transformers.models.qwen3_vl.processing_qwen3_vl.Qwen3VLProcessor = _Qwen3VLProcessor
-    transformers.models.auto.processing_auto.PROCESSOR_MAPPING[Qwen3VLConfig] = _Qwen3VLProcessor
+    transformers.models.qwen3_vl.processing_qwen3_vl.Qwen3VLProcessor = Qwen3VLProcessor
+    transformers.models.auto.processing_auto.PROCESSOR_MAPPING[Qwen3VLConfig] = Qwen3VLProcessor

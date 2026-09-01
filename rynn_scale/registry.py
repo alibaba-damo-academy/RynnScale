@@ -6,9 +6,7 @@ class Registry(object):
         self._objects = dict()
 
     def _add(self, name: str, obj: object):
-        if name in self._objects:
-            raise ValueError(f"Object {name} is already registered.")
-        self._objects[name] = obj
+        self._objects.setdefault(name, obj)
 
     def register(self, name: Optional[str] = None, obj: Optional[object] = None):
         if obj is not None:
@@ -38,3 +36,6 @@ class Registry(object):
 DATASET_REGISTRY = Registry()
 BENCHMARK_REGISTRY = Registry()
 INFERENCE_WRAPPER_REGISTRY = Registry()
+ENVIRONMENT_REGISTRY = Registry()
+RENDERER_REGISTRY = Registry()
+AGENT_REGISTRY = Registry()

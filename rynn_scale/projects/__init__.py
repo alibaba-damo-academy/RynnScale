@@ -1,9 +1,8 @@
+import importlib.util
 import os
 import sys
-import importlib.util
 
 from ..utils.logging import get_logger
-
 
 logger = get_logger(__name__)
 
@@ -24,5 +23,7 @@ def register_projects():
                     spec.loader.exec_module(module)
                     spec = importlib.util.spec_from_file_location(entry, str(init_path))
                 except Exception as e:
-                    import traceback; traceback.print_exc()
+                    import traceback
+
+                    traceback.print_exc()
                     logger.warning(f"Failed to import projects/{entry}: {e}")

@@ -6,8 +6,8 @@ from io import BytesIO
 
 from PIL import Image
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 
 @BENCHMARK_REGISTRY.register()
@@ -24,7 +24,7 @@ class EmbSpatial(BaseBenchmark):
 
             options = data["answer_options"]
             answer_idx = data["answer"]
-            option_letters = [chr(ord('A') + i) for i in range(len(options))]
+            option_letters = [chr(ord("A") + i) for i in range(len(options))]
 
             data_dict[question_id] = {
                 "images": [image],
@@ -67,27 +67,31 @@ class EmbSpatial(BaseBenchmark):
 
         print(f"[EmbSpatial] {data_id} | Q: {meta_data['question']} | Response: {response}")
 
-        cleaned = re.sub(r'\b[Aa]nswer\b', '', response)
-        pred_answer = re.findall(r'(?:^|[\s\(])([A-D])(?:[\s\)\.\,\:]|$)', cleaned)
+        cleaned = re.sub(r"\b[Aa]nswer\b", "", response)
+        pred_answer = re.findall(r"(?:^|[\s\(])([A-D])(?:[\s\)\.\,\:]|$)", cleaned)
 
         if len(pred_answer) == 0:
             last_match_idx = None
             last_match_pos = -1
             for idx, opt in enumerate(options):
-                pattern = r'\b' + re.escape(opt.lower().strip()) + r'\b'
+                pattern = r"\b" + re.escape(opt.lower().strip()) + r"\b"
                 matches = list(re.finditer(pattern, response.lower()))
                 if matches and matches[-1].start() > last_match_pos:
                     last_match_pos = matches[-1].start()
                     last_match_idx = idx
             if last_match_idx is not None:
-                print(f"[EmbSpatial] {data_id} | Pred: {last_match_idx} (text: '{options[last_match_idx]}') | GT: {ground_truth} | {'✓' if last_match_idx == ground_truth else '✗'}")
+                print(
+                    f"[EmbSpatial] {data_id} | Pred: {last_match_idx} (text: '{options[last_match_idx]}') | GT: {ground_truth} | {'✓' if last_match_idx == ground_truth else '✗'}"
+                )
                 return last_match_idx
             print(f"[EmbSpatial] {data_id} | Pred: None | GT: {ground_truth}")
             return None
         else:
             pred_answer = pred_answer[-1].strip()
             pred_idx = option_letters.index(pred_answer)
-            print(f"[EmbSpatial] {data_id} | Pred: {pred_idx} ({pred_answer}) | GT: {ground_truth} | {'✓' if pred_idx == ground_truth else '✗'}")
+            print(
+                f"[EmbSpatial] {data_id} | Pred: {pred_idx} ({pred_answer}) | GT: {ground_truth} | {'✓' if pred_idx == ground_truth else '✗'}"
+            )
             return pred_idx
 
     async def get_matching_score(self, data_id, prediction):

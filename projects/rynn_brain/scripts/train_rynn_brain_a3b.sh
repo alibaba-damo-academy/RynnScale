@@ -38,11 +38,9 @@ OPTIMIZER_ARGS=(
 )
 
 TRAINING_ARGS=(
-    --deepspeed configs/zero2.json
     --expert_parallel_size 2
     --gradient_checkpointing True
-    --bf16 True
-    --fp16 False
+    --param_dtype bfloat16
     --dataloader_num_workers 8
     --decoder_load_balancing True
     --loss_reduction_scope sequence

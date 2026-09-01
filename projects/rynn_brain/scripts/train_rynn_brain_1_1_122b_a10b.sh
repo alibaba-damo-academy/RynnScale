@@ -48,16 +48,13 @@ OPTIMIZER_ARGS=(
 )
 
 TRAINING_ARGS=(
-    --deepspeed configs/zero1.json
     --expert_parallel_size 8
     --synchronize_experts_before_forward True
     --pipeline_parallel_size $PP_SIZE
     --pipeline_parallel_schedule 1f1b
     --pp_broadcast_data True
     --gradient_checkpointing True
-    --loss_implementation cce
-    --bf16 True
-    --fp16 False
+    --param_dtype bfloat16
     --dataloader_num_workers 8
     --decoder_load_balancing True
     --loss_reduction_scope sequence

@@ -1,9 +1,8 @@
 import os
 import subprocess
+
 from setuptools import setup
-
-from torch.utils.cpp_extension import CUDAExtension, BuildExtension
-
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 DEFAULT_CUTLASS_DIR = os.path.join(os.path.dirname(__file__), "external", "cutlass")
 CUTLASS_DIR = os.environ.get("CUTLASS_DIR", DEFAULT_CUTLASS_DIR)
@@ -47,7 +46,7 @@ except Exception as _:
 
 setup(
     name="rynn_scale",
-    version="0.1.0" + revision,
+    version="1.0.0" + revision,
     description="",
     packages=["rynn_scale"],
     ext_modules=ext_modules,

@@ -2,7 +2,6 @@ import io
 import os
 import re
 
-import pandas as pd
 from PIL import Image
 
 from ..registry import BENCHMARK_REGISTRY
@@ -12,6 +11,8 @@ from .base import BaseBenchmark
 @BENCHMARK_REGISTRY.register()
 class MMSI(BaseBenchmark):
     def load_data(self, data_root):
+        import pandas as pd
+
         data_dict = {}
         data_path = os.path.join(data_root, "MMSI_Bench.parquet")
         df = pd.read_parquet(data_path)

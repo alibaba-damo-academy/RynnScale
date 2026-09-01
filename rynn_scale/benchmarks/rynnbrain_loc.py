@@ -1,13 +1,14 @@
+import json
+import math
 import os
+import re
 from collections import defaultdict
 from typing import Any, Dict, List, Union
-import json
-import re
-import math
+
 import numpy as np
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 TASKS = {
     "Referring": "rynnbrain_referring_2000.jsonl",
@@ -63,7 +64,7 @@ class RynnBrainLoc(BaseBenchmark):
             # print('len(data_list)',len(data_list))
             for i, data in enumerate(data_list):
                 # if i<1:
-                    # continue
+                # continue
                 # if i>1:
                 #     break
                 data_id = data.get("id", 0)
@@ -71,12 +72,11 @@ class RynnBrainLoc(BaseBenchmark):
                 task_type = data.get("task_type", "unknown")
                 conversation = data.get("conversation", [])
 
-
                 # resolve data
                 for msg in conversation:
                     if msg["role"] == "assistant":
                         # print('msg["content"]', msg["content"])
-                        assistant_content = msg.get('content', [])
+                        assistant_content = msg.get("content", [])
                         last_content = assistant_content[-1] if assistant_content else {}
                         # answer = assistant_content[-1].get("text", "") if assistant_content else ""
                         answer = (
@@ -87,8 +87,12 @@ class RynnBrainLoc(BaseBenchmark):
                             or ""
                         )
                     elif msg["role"] == "user":
-                        user_content = msg.get('content', [])
-                        image_path = [os.path.join(data_folder, item['image']) for item in user_content if item.get('type') == 'image']
+                        user_content = msg.get("content", [])
+                        image_path = [
+                            os.path.join(data_folder, item["image"])
+                            for item in user_content
+                            if item.get("type") == "image"
+                        ]
                         question = user_content[-1].get("text", "") if user_content else ""
 
                 data_dict[data_id] = {
@@ -110,55 +114,29 @@ class RynnBrainLoc(BaseBenchmark):
         image_path = meta_data["images"]
         task_type = meta_data["task_type"]
 
-        if self.prompt_format == "RynnBrain":
-            if task_type in self.REFERRING_TYPES:
-                prompt = f"Output the bounding box in the format <object> <frame n>: ...; (x1,y1), (x2,y2) </object>. n is the chosen frame index."
-                thinking_prompt = "\nOutput format: `#### <answer><object><frame i> (X_min, Y_min), (X_max, Y_max) </object></answer>`. Coordinates normalized to 0-1000."
-                self.SYSTEM_PROMPT = SYSTEM_PROMPT_REFERRING
-            elif task_type in self.TRAJ_TYPES:
-                prompt = f"First predict the frame containing the trajectory start point, then output up to 10 key trajectory points as a list of tuples in the format: <trajectory> <frame n>: ...; (x1, y1), (x2, y2), .... </trajectory> All coordinates must be normalized between 0 and 1000."
-                thinking_prompt = f"\nFirst predict the frame containing the trajectory start point, then output up to 10 key trajectory points as a list of tuples.\nOutput format: `#### <answer><trajectory><frame i> (X_1, Y_1), (X_2, Y_2), ..., (X_N, Y_N) </trajectory></answer>`. Coordinates normalized to 0-1000."
-                self.SYSTEM_PROMPT = SYSTEM_PROMPT_TRAJ
-            elif task_type in self.AFFORDANCE_TYPES:
-                prompt = f"First predict the key frame, then output a single affordance point as coordinates (x, y).\nOutput format: <affordance> <frame n>: ...; (x, y) </affordance>\n Both x and y values must be normalized between 0 and 1000."
-                thinking_prompt = f"\nFirst predict the key frame, then output a single affordance point as coordinates (x, y).\nOutput format: `#### <answer><affordance><frame i> (X, Y) </affordance></answer>`. Coordinates normalized to 0-1000."
-                self.SYSTEM_PROMPT = SYSTEM_PROMPT_AFFORDANCE
-            elif task_type in self.AREA_TYPES:
-                prompt = f"First predict the key frame, then output coordinates as a series of tuples. \nOutput format: <area> <frame n>: ...; (x1, y1), (x2, y2), .... </area>\n All coordinates must be normalized between 0 and 1000."
-                thinking_prompt = f"\nFirst predict the key frame, then output coordinates as a series of tuples.\nOutput format: `#### <answer><area><frame i> (X_1, Y_1), ... </area></answer>`. Coordinates normalized to 0-1000."
-                self.SYSTEM_PROMPT = SYSTEM_PROMPT_AREA
-        elif self.prompt_format == "RynnBrain1.1":
-            if task_type in self.REFERRING_TYPES:
-                prompt = "Predict the bounding box. Output the result in JSON format."
-                # prompt = 'Output the result in JSON format. Example:\n```json\n[{"bbox": [x_min, y_min, x_max, y_max], "frame_idx": 0, "label": "object"}]\n```'
-                thinking_prompt = "\nOutput format: `#### <answer><object><frame i> (X_min, Y_min), (X_max, Y_max) </object></answer>`. Coordinates normalized to 0-1000."
-                self.SYSTEM_PROMPT = SYSTEM_PROMPT_REFERRING
-            elif task_type in self.TRAJ_TYPES:
-                prompt = "Predict the trajectory points. Output the result in JSON format."
-                # prompt = "Execute sequential trajectory analysis:\n1. Identify the frame containing trajectory initiation point\nOutput the result in JSON format."
-                thinking_prompt = f"\nFirst predict the frame containing the trajectory start point, then output up to 10 key trajectory points as a list of tuples.\nOutput format: `#### <answer><trajectory><frame i> (X_1, Y_1), (X_2, Y_2), ..., (X_N, Y_N) </trajectory></answer>`. Coordinates normalized to 0-1000."
-                self.SYSTEM_PROMPT = SYSTEM_PROMPT_TRAJ
-            elif task_type in self.AFFORDANCE_TYPES:
-                prompt = "Predict the affordance point. Output the result in JSON format."
-                # prompt = "Follow this exact sequence:\n1. Predict key frame\n2. Output one affordance point as Python tuple\nOutput the result in JSON format."
-                thinking_prompt = f"\nFirst predict the key frame, then output a single affordance point as coordinates (x, y).\nOutput format: `#### <answer><affordance><frame i> (X, Y) </affordance></answer>`. Coordinates normalized to 0-1000."
-                self.SYSTEM_PROMPT = SYSTEM_PROMPT_AFFORDANCE
-            elif task_type in self.AREA_TYPES:
-                prompt = "Predict the area polygon. Output the result in JSON format."
-                # prompt = "Follow this exact sequence:\n1. Predict key frame\n2. Output tuple series\nOutput the result in JSON format."
-                thinking_prompt = f"\nFirst predict the key frame, then output coordinates as a series of tuples.\nOutput format: `#### <answer><area><frame i> (X_1, Y_1), ... </area></answer>`. Coordinates normalized to 0-1000."
-                self.SYSTEM_PROMPT = SYSTEM_PROMPT_AREA
-        else:
-            raise NotImplementedError
-
+        if task_type in self.REFERRING_TYPES:
+            prompt = "Output the bounding box in the format <object> <frame n>: ...; (x1,y1), (x2,y2) </object>. n is the chosen frame index."
+            thinking_prompt = "\nOutput format: `#### <answer><object><frame i> (X_min, Y_min), (X_max, Y_max) </object></answer>`. Coordinates normalized to 0-1000."
+            self.SYSTEM_PROMPT = SYSTEM_PROMPT_REFERRING
+        elif task_type in self.TRAJ_TYPES:
+            prompt = "First predict the frame containing the trajectory start point, then output up to 10 key trajectory points as a list of tuples in the format: <trajectory> <frame n>: ...; (x1, y1), (x2, y2), .... </trajectory> All coordinates must be normalized between 0 and 1000."
+            thinking_prompt = "\nFirst predict the frame containing the trajectory start point, then output up to 10 key trajectory points as a list of tuples.\nOutput format: `#### <answer><trajectory><frame i> (X_1, Y_1), (X_2, Y_2), ..., (X_N, Y_N) </trajectory></answer>`. Coordinates normalized to 0-1000."
+            self.SYSTEM_PROMPT = SYSTEM_PROMPT_TRAJ
+        elif task_type in self.AFFORDANCE_TYPES:
+            prompt = "First predict the key frame, then output a single affordance point as coordinates (x, y).\nOutput format: <affordance> <frame n>: ...; (x, y) </affordance>\n Both x and y values must be normalized between 0 and 1000."
+            thinking_prompt = "\nFirst predict the key frame, then output a single affordance point as coordinates (x, y).\nOutput format: `#### <answer><affordance><frame i> (X, Y) </affordance></answer>`. Coordinates normalized to 0-1000."
+            self.SYSTEM_PROMPT = SYSTEM_PROMPT_AFFORDANCE
+        elif task_type in self.AREA_TYPES:
+            prompt = "First predict the key frame, then output coordinates as a series of tuples. \nOutput format: <area> <frame n>: ...; (x1, y1), (x2, y2), .... </area>\n All coordinates must be normalized between 0 and 1000."
+            thinking_prompt = "\nFirst predict the key frame, then output coordinates as a series of tuples.\nOutput format: `#### <answer><area><frame i> (X_1, Y_1), ... </area></answer>`. Coordinates normalized to 0-1000."
+            self.SYSTEM_PROMPT = SYSTEM_PROMPT_AREA
         if self.THINKING_MODE:
-
-            instruction = f'{question}{thinking_prompt}' if question[-1] == "." else f'{question}.{thinking_prompt}'
+            instruction = f"{question}{thinking_prompt}" if question[-1] == "." else f"{question}.{thinking_prompt}"
             # instruction = f'{question}.{thinking_prompt}'
             # if task_type in self.AFFORDANCE_TYPES or task_type in self.AREA_TYPES or task_type in self.REFERRING_TYPES:
             #     instruction = f'{question}. {prompt}{thinking_prompt}'
         else:
-            instruction = f'{question}. {prompt}'
+            instruction = f"{question}. {prompt}"
         # print('instruction', instruction)
 
         if isinstance(instruction, str):
@@ -183,90 +161,37 @@ class RynnBrainLoc(BaseBenchmark):
 
     async def process_response(self, data_id: Union[int, str], response: str) -> Any:
         """Process the raw model response."""
-        if self.prompt_format == "RynnBrain":
-            # Normalize the response similarly to the ground truth for fair comparison
-            raw_response = response.strip()
-            meta_data = self.data_dict[data_id]
-            image_path = meta_data["images"]
+        # Normalize the response similarly to the ground truth for fair comparison
+        raw_response = response.strip()
+        meta_data = self.data_dict[data_id]
+        image_path = meta_data["images"]
 
-            # resolve frame
-            # match = re.search(r"<frame\s*(\d+)>", outputs)
-            # matches = re.findall(r"<frame\s*(\d+)>", outputs)
-            # match = list(re.finditer(r"<frame\s*(\d+)>:", outputs))
-            match = list(re.finditer(r"<frame\s*(\d+)>:?", raw_response))
-            total_frame = len(image_path)
-            if match:
-                if 0 <= int(match[-1].group(1)) < total_frame:
-                    frame_idx = int(match[-1].group(1))  # 提取并转为整数
-                    # print('Predicted frame idx', frame_idx)
-                else:
-                    frame_idx = total_frame - 1
-                    # print('Predicted frame out of index, using the last frame', frame_idx)
+        # resolve frame
+        # match = re.search(r"<frame\s*(\d+)>", outputs)
+        # matches = re.findall(r"<frame\s*(\d+)>", outputs)
+        # match = list(re.finditer(r"<frame\s*(\d+)>:", outputs))
+        match = list(re.finditer(r"<frame\s*(\d+)>:?", raw_response))
+        total_frame = len(image_path)
+        if match:
+            if 0 <= int(match[-1].group(1)) < total_frame:
+                frame_idx = int(match[-1].group(1))  # 提取并转为整数
+                # print('Predicted frame idx', frame_idx)
             else:
                 frame_idx = total_frame - 1
-                # print("Frame ID not found, using the last frame", frame_idx)
-
-            if self.THINKING_MODE:
-                match = re.findall(r'<answer>(.*?)</answer>', raw_response, re.DOTALL)
-                response = match[0].strip() if match else raw_response
-
-            pm = [(int(x), int(y)) for x, y in re.findall(r"\((\d+)\s*,\s*(\d+)\)", response)][:10]
-            
-            results = json.dumps(
-                {
-                    'frame_idx': frame_idx,
-                    "response": raw_response,
-                    'outputs': pm
-                }
-            )
-
-        elif self.prompt_format == "RynnBrain1.1":
-            pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
-            match = re.search(pattern, response)
-            if match:
-                response = match.group(1)
-            response = response.strip()
-
-            meta_data = self.data_dict[data_id]
-            task_type = meta_data["task_type"]
-            total_frame = len(meta_data["images"])
-
-            try:
-                results = json.loads(response)
-                if isinstance(results, list):
-                    results = results[0]
-                frame_idx = results["frame_idx"]
-
-                if task_type in self.REFERRING_TYPES:
-                    points = results["bbox"]
-                elif task_type in self.TRAJ_TYPES:
-                    points = results["trajectory"]
-                elif task_type in self.AFFORDANCE_TYPES:
-                    points = [results["point"]]
-                elif task_type in self.AREA_TYPES:
-                    points = results["polygon"]
-                else:
-                    raise NotImplementedError
-
-            except Exception:
-                import traceback; traceback.print_exc()
-                print(f"Match failed: {response}")
-                frame_idx = total_frame - 1
-                points = [[0, 0]]
-
-            results = json.dumps(
-                {
-                    "frame_idx": frame_idx,
-                    "response": response,
-                    "outputs": points,
-                }
-            )
-
+                # print('Predicted frame out of index, using the last frame', frame_idx)
         else:
-            raise NotImplementedError
+            frame_idx = total_frame - 1
+            # print("Frame ID not found, using the last frame", frame_idx)
 
+        if self.THINKING_MODE:
+            match = re.findall(r"<answer>(.*?)</answer>", raw_response, re.DOTALL)
+            response = match[0].strip() if match else raw_response
+
+        pm = [(int(x), int(y)) for x, y in re.findall(r"\((\d+)\s*,\s*(\d+)\)", response)][:10]
+
+        results = json.dumps({"frame_idx": frame_idx, "response": raw_response, "outputs": pm})
         return results
-    
+
     async def get_matching_score(self, data_id, prediction):
         """
         Compute the matching score between model prediction and ground truth.
@@ -282,22 +207,22 @@ class RynnBrainLoc(BaseBenchmark):
 
         if task_type in self.REFERRING_TYPES:
             label = process_referring_label(ground_truth, image_path, frame_idx)
-            score = calculate_iou_bbox(pred_points[-2:], label) # 取最后一个prediction计算
+            score = calculate_iou_bbox(pred_points[-2:], label)  # 取最后一个prediction计算
         elif task_type in self.TRAJ_TYPES:
             label = process_area_traj_affor_label(ground_truth, frame_idx)
-            pred_points = [(pred[0]/1000, pred[1]/1000) for pred in pred_points if len(pred)==2] # normalize
-            score = calculate_dfd(pred_points, label, num_samples = 15)
+            pred_points = [(pred[0] / 1000, pred[1] / 1000) for pred in pred_points if len(pred) == 2]  # normalize
+            score = calculate_dfd(pred_points, label, num_samples=15)
         elif task_type in self.AFFORDANCE_TYPES:
             label = process_area_traj_affor_label(ground_truth, frame_idx)
-            pred_points = [(pred[0]/1000, pred[1]/1000) for pred in pred_points if len(pred)==2] # normalize
+            pred_points = [(pred[0] / 1000, pred[1] / 1000) for pred in pred_points if len(pred) == 2]  # normalize
             score = calculate_nearest_distances(pred_points, label)
         elif task_type in self.AREA_TYPES:
             label = process_area_traj_affor_label(ground_truth, frame_idx)
-            pred_points = [(pred[0]/1000, pred[1]/1000) for pred in pred_points if len(pred)==2] # normalize
+            pred_points = [(pred[0] / 1000, pred[1] / 1000) for pred in pred_points if len(pred) == 2]  # normalize
             score = calculate_points_in_polygon(pred_points, label)
         else:
             raise NotImplementedError
-        print(f'| dataid: {data_id} | pred: {prediction} | score: {score} |')
+        print(f"| dataid: {data_id} | pred: {prediction} | score: {score} |")
         return score
 
     def compute_metrics(self, results):
@@ -305,7 +230,7 @@ class RynnBrainLoc(BaseBenchmark):
         for data in results:
             data_id = data["data_id"]
             score = data["score"]
-            task_type = self.data_dict[data_id]['task_type']
+            task_type = self.data_dict[data_id]["task_type"]
             sample_scores[task_type].append(score)
 
         task_metrics = {}
@@ -321,12 +246,10 @@ class RynnBrainLoc(BaseBenchmark):
 
         # Object referring metrics
         referring_scores = [
-            score for t, scores in sample_scores.items()
-            if t in self.REFERRING_TYPES
-            for score in scores
+            score for t, scores in sample_scores.items() if t in self.REFERRING_TYPES for score in scores
         ]
         referring_metrics = (
-            {'Object Referring': sum(score > 0.5 for score in referring_scores) / len(referring_scores)}
+            {"Object Referring": sum(score > 0.5 for score in referring_scores) / len(referring_scores)}
             if referring_scores
             else {}
         )
@@ -334,6 +257,7 @@ class RynnBrainLoc(BaseBenchmark):
         metrics = {**referring_metrics, **task_metrics}
 
         return metrics
+
 
 SYSTEM_PROMPT_REFERRING = [
     {
@@ -343,7 +267,7 @@ SYSTEM_PROMPT_REFERRING = [
             "Put your final answer in the format of `#### <answer><object><frame i> (X_min, Y_min), (X_max, Y_max) </object></answer>`."
         ),
     }
-]    
+]
 
 SYSTEM_PROMPT_TRAJ = [
     {
@@ -422,7 +346,7 @@ def calculate_iou_bbox(box1, box2):
     """
     if not box1 or not box2:
         return 0.0
-    
+
     if len(box1) == 0 or len(box2) == 0:
         return math.exp(-float("inf"))
 
@@ -584,7 +508,7 @@ def calculate_points_in_polygon(pred_points, gt_points):
     返回:
         list of bool，对应每个预测点是否在多边形内部（含边界）
     """
-    from shapely.geometry import Polygon, Point
+    from shapely.geometry import Point, Polygon
 
     if not pred_points or not gt_points:
         return 0.0

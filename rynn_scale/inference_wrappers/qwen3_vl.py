@@ -10,13 +10,13 @@ from transformers.models.qwen3_vl.video_processing_qwen3_vl import smart_resize 
 from ..registry import INFERENCE_WRAPPER_REGISTRY
 from ..utils import logging
 from ..utils.processing import load_video
-from .base import BaseInferenceWrapper
+from .base import BaseVLMInferenceWrapper
 
 logger = logging.get_logger(__file__)
 
 
 @INFERENCE_WRAPPER_REGISTRY.register("qwen3_vl")
-class Qwen3VLInferenceWrapper(BaseInferenceWrapper):
+class Qwen3VLInferenceWrapper(BaseVLMInferenceWrapper):
     def load_model(self):
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             self.model_path,
@@ -156,7 +156,7 @@ class Qwen3VLInferenceWrapper(BaseInferenceWrapper):
             curr_timestamp = self.processor._calculate_timestamps(
                 metadata.frames_indices,
                 metadata.fps,
-                self.processor.video_processor.merge_size,
+                self.processor.video_processor.temporal_patch_size,
             )
 
             video_placeholder = ""
@@ -191,6 +191,7 @@ class Qwen3VLInferenceWrapper(BaseInferenceWrapper):
             return_token_type_ids=False,
         )
         self.processor._check_special_mm_tokens([text], text_inputs, modalities=["image", "video"])
+        text_inputs["mm_token_type_ids"] = self.processor.create_mm_token_type_ids(text_inputs["input_ids"])
 
         model_inputs = {
             **text_inputs,

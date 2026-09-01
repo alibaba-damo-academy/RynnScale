@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ..constants import MOE_PERMUTE_BACKEND
+
 
 @triton.jit
 def _moe_token_permute_preprocess(
@@ -37,7 +39,11 @@ _configs = [
 
 
 def _prune_func(configs, named_args, **kwargs):
-    configs = [c for c in configs if c.kwargs["BLOCK_K"] <= named_args["hidden_size"] and named_args["hidden_size"] % c.kwargs["BLOCK_K"] == 0]
+    configs = [
+        c
+        for c in configs
+        if c.kwargs["BLOCK_K"] <= named_args["hidden_size"] and named_args["hidden_size"] % c.kwargs["BLOCK_K"] == 0
+    ]
     assert len(configs), f"no configs found for hidden_size={named_args['hidden_size']}"
     return configs
 
@@ -266,7 +272,9 @@ class MoeTokenPermuteFunction(torch.autograd.Function):
         num_permuted_tokens = sum(num_routed_tokens)
         sorted_indices = torch.argsort(routed_expert_indices.flatten(), stable=True)[-num_permuted_tokens:]
 
-        permuted_indices = torch.empty((num_tokens, num_experts_per_token), dtype=torch.int32, device=hidden_states.device).fill_(-1)
+        permuted_indices = torch.empty(
+            (num_tokens, num_experts_per_token), dtype=torch.int32, device=hidden_states.device
+        ).fill_(-1)
 
         _moe_token_permute_preprocess[lambda META: (triton.cdiv(num_permuted_tokens, META["BLOCK_N"]),)](
             sorted_indices,
@@ -276,7 +284,9 @@ class MoeTokenPermuteFunction(torch.autograd.Function):
             BLOCK_N=64,
         )
 
-        permuted_tokens = torch.empty(num_permuted_tokens, hidden_size, dtype=hidden_states.dtype, device=hidden_states.device)
+        permuted_tokens = torch.empty(
+            num_permuted_tokens, hidden_size, dtype=hidden_states.dtype, device=hidden_states.device
+        )
 
         _moe_token_permute_fwd_kernel[lambda META: (num_tokens, triton.cdiv(hidden_size, META["BLOCK_K"]))](
             hidden_states,
@@ -303,7 +313,7 @@ class MoeTokenPermuteFunction(torch.autograd.Function):
         grad_outputs,
         grad_permuted_indices,
     ):
-        permuted_indices, = ctx.saved_tensors
+        (permuted_indices,) = ctx.saved_tensors
         grad_inputs = grad_outputs.new_empty((ctx.num_tokens, ctx.hidden_size))
 
         _moe_token_permute_bwd_kernel[lambda META: (ctx.num_tokens, triton.cdiv(ctx.hidden_size, META["BLOCK_K"]))](
@@ -384,7 +394,9 @@ class MoeTokenUnpermuteFunction(torch.autograd.Function):
         del inputs
         grad_inputs = torch.empty(shape, dtype=dtype, device=grad_probs.device)
 
-        _moe_token_unpermute_bwd_dx_kernel[lambda META: (ctx.num_tokens, triton.cdiv(ctx.hidden_size, META["BLOCK_K"]))](
+        _moe_token_unpermute_bwd_dx_kernel[
+            lambda META: (ctx.num_tokens, triton.cdiv(ctx.hidden_size, META["BLOCK_K"]))
+        ](
             grad_outputs,
             grad_inputs,
             probs,
@@ -407,7 +419,7 @@ def moe_token_permute(
     routed_expert_indices: torch.LongTensor,
     num_routed_tokens: List[int],
     num_experts_per_token: int,
-    backend: str = "triton",
+    backend: str = MOE_PERMUTE_BACKEND,
 ):
     if backend == "triton":
         return MoeTokenPermuteFunction.apply(
@@ -430,7 +442,7 @@ def moe_token_unpermute(
     probs: torch.FloatTensor,
     permuted_indices: torch.LongTensor,
     num_experts_per_token: int,
-    backend: str = "triton",
+    backend: str = MOE_PERMUTE_BACKEND,
 ):
     if backend == "triton":
         return MoeTokenUnpermuteFunction.apply(

@@ -8,14 +8,19 @@ from typing import Any, Dict, List, Optional, Union
 from openai import AsyncOpenAI
 from torch.utils.data import Dataset
 
+from ..inference_wrappers import BaseInferenceWrapper
+
 
 class BaseBenchmark(Dataset, metaclass=ABCMeta):
     def __init__(
         self,
         data_root: str,
+        inference_wrapper: BaseInferenceWrapper,
         prompt_format: Optional[str] = None,
         enable_thinking: bool = False,
     ) -> None:
+        self.data_root = data_root
+        self.inference_wrapper = inference_wrapper
         self.prompt_format = prompt_format
         self.enable_thinking = enable_thinking
 
@@ -55,11 +60,14 @@ class BaseBenchmark(Dataset, metaclass=ABCMeta):
             if aggregated_id not in aggregated_data:
                 aggregated_data[aggregated_id] = {
                     "data_ids": [data_id],
-                    "images": meta_data.get("images", None),
-                    "videos": meta_data.get("videos", None),
+                    "images": tuple(meta_data.get("images", [])),
+                    "videos": tuple(meta_data.get("videos", [])),
                 }
             else:
                 aggregated_data[aggregated_id]["data_ids"].append(data_id)
+
+        for data in aggregated_data.values():
+            data["data_ids"] = tuple(data["data_ids"])
 
         self._aggregated_data = [x for _, x in aggregated_data.items()]
 
@@ -72,12 +80,22 @@ class BaseBenchmark(Dataset, metaclass=ABCMeta):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         output = {
-            "data_ids": self._aggregated_data[idx]["data_ids"],
-            "enable_thinking": self.enable_thinking,
-            "conversations": [
-                self.generate_instruction(data_id) for data_id in self._aggregated_data[idx]["data_ids"]
-            ],
+            "data_id": self._aggregated_data[idx]["data_ids"],
+            "image_data": self._aggregated_data[idx]["images"],
+            "video_data": self._aggregated_data[idx]["videos"],
+            "prompt": [],
+            "agent_config": [],
         }
+
+        for data_id in output["data_id"]:
+            # Pass the instruction through untouched: a plain string for VLA
+            # (the env's task text) or a chat conversation for VLM. The chat
+            # template is applied downstream by the Processor, which also needs
+            # the un-flattened conversation to locate its image/video items --
+            # flattening it to a string here would drop that media.
+            output["prompt"].append(self.generate_instruction(data_id))
+            output["agent_config"].append(self.get_agent_config(data_id))
+
         return output
 
     @abstractmethod
@@ -110,6 +128,7 @@ class BaseBenchmark(Dataset, metaclass=ABCMeta):
         """
         pass
 
+    # TODO: rename
     @abstractmethod
     def generate_instruction(self, data_id: Union[int, str]) -> List[Dict[str, Any]]:
         """
@@ -122,6 +141,38 @@ class BaseBenchmark(Dataset, metaclass=ABCMeta):
             instruction (Union[str, Dict[str, str]]): instruction(s) for model inference.
         """
         pass
+
+    def get_agent_config(self, data_id: Union[int, str]) -> Optional[Dict[str, Any]]:
+        """
+        Declare the agent that runs one sample of this benchmark, and how to build it.
+
+        ``None`` -- the default -- means this benchmark needs no episode loop of its
+        own: the evaluator runs it as one generation per sample
+        (:class:`~rynn_scale.agents.single_turn.SingleTurnAgent`), which is every
+        VLM benchmark.
+
+        Args:
+            data_id (Union[int, str]): identifier of the data.
+
+        Returns:
+            Optional[Dict[str, Any]]: ``type`` plus that agent's constructor kwargs --
+
+            * ``type``: registered agent name (see :mod:`rynn_scale.agents`), e.g.
+              ``"RobotAgent"``.
+            * everything else: passed to the agent's ``__init__`` verbatim, on top of
+              the ``model`` / ``buffer`` the evaluator supplies. For ``RobotAgent``
+              that is ``env_type`` + ``env_config`` (what defines the world and fixes
+              its cost -- a Libero ``bddl_file_name`` pins the MuJoCo model and its GL
+              context), ``reset_config`` (what places this one episode inside that
+              world, e.g. a Libero ``init_state``, which only writes qpos/qvel) and
+              ``max_steps`` (this episode's step budget).
+
+            One agent runs one sample, so the whole episode is settled at
+            construction and the evaluator's ``rollout`` call only names the sample.
+            A key the agent's constructor does not accept is a ``TypeError``, not a
+            silent drop.
+        """
+        return None
 
     @abstractmethod
     async def process_response(self, data_id: Union[int, str], response: str) -> Any:

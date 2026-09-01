@@ -36,16 +36,14 @@ class DataCollator(object):
 
         for instance in instances:
             input_ids = instance.get("input_ids")
-            position_ids = instance.get(
-                "position_ids", torch.arange(instance["input_ids"].size(-1)).unsqueeze(0)
-            )
+            position_ids = instance.get("position_ids", torch.arange(instance["input_ids"].size(-1)).unsqueeze(0))
             labels = instance.get("labels", None)
 
             if "labels" in instance:
                 labels = instance["labels"].clone()
-                labels[..., 0] = -100
             else:
-                labels = None
+                labels = torch.full_like(input_ids, fill_value=-100, dtype=torch.long)
+            labels[..., 0] = -100
 
             input_ids, _, position_ids, labels = context_parallel.pad_sequence(
                 input_ids,
@@ -64,11 +62,9 @@ class DataCollator(object):
         cu_seq_lens = torch.as_tensor(cu_seq_lens, dtype=torch.int32)
 
         batch = {
-            "data_indices": [instance["data_index"] for instance in instances],
             "input_ids": torch.cat(input_ids_list, dim=-1),
             "position_ids": torch.cat(position_ids_list, dim=-1),
             "labels": torch.cat(labels_list, dim=-1),
-            "use_cache": False,
             **self._collate_mm_inputs(instances),
             "cu_seq_lens_q": cu_seq_lens,
             "cu_seq_lens_k": cu_seq_lens,
@@ -76,36 +72,68 @@ class DataCollator(object):
             "max_length_k": max_length,
         }
 
+        if "actions" in instances[0]:
+            batch["actions"] = torch.cat([instance["actions"] for instance in instances], dim=0)
+
+        if "action_mask" in instances[0]:
+            batch["action_mask"] = torch.cat([instance["action_mask"] for instance in instances], dim=0)
+
+        if "states" in instances[0]:
+            batch["states"] = torch.cat([instance["states"] for instance in instances], dim=0)
+
+        if "data_index" in instances[0]:
+            batch["data_indices"] = [instance["data_index"] for instance in instances]
+
         return batch
 
     def _collate_fn_padding(self, instances):
         input_ids = torch.nn.utils.rnn.pad_sequence(
-            [instance["input_ids"] for instance in instances],
+            [instance["input_ids"][0] for instance in instances],
             batch_first=True,
             padding_value=self.processor.tokenizer.pad_token_id,
-        )
-        labels = torch.nn.utils.rnn.pad_sequence(
-            [instance["labels"] for instance in instances],
-            batch_first=True,
-            padding_value=self.processor.tokenizer.pad_token_id,
+            padding_side="left",
         )
 
-        attention_mask = torch.zeros_like(input_ids)
-        position_ids = torch.ones_like(input_ids)
-        for i, instance in enumerate(instances):
-            seq_len = instance["input_ids"].size(-1)
-            if "attention_mask" in instance:
-                attention_mask[i, :seq_len] = instance["attention_mask"]
-            else:
-                attention_mask[i, :seq_len] = 1
+        if "attention_mask" in instances[0]:
+            attention_mask = torch.nn.utils.rnn.pad_sequence(
+                [instance["attention_mask"][0] for instance in instances],
+                batch_first=True,
+                padding_value=0,
+                padding_side="left",
+            )
+        else:
+            attention_mask = input_ids != self.processor.tokenizer.pad_token_id
 
-            if "position_ids" in instance:
-                position_ids[i, :seq_len] = instance["position_ids"]
+        if "position_ids" in instances[0]:
+            if instances[0]["position_ids"].ndim == 3:
+                position_ids = torch.nn.utils.rnn.pad_sequence(
+                    [instance["position_ids"][:, 0].transpose(0, 1) for instance in instances],
+                    batch_first=True,
+                    padding_value=1,
+                    padding_side="left",
+                ).permute(2, 0, 1)
             else:
-                position_ids[i, :seq_len] = torch.arange(seq_len)
+                position_ids = torch.nn.utils.rnn.pad_sequence(
+                    [instance["position_ids"][0] for instance in instances],
+                    batch_first=True,
+                    padding_value=1,
+                    padding_side="left",
+                )
+        else:
+            assert attention_mask.ndim == 2
+            position_ids = attention_mask.cumsum(-1) - 1
+
+        if "labels" in instances[0]:
+            labels = torch.nn.utils.rnn.pad_sequence(
+                [instance["labels"][0] for instance in instances],
+                batch_first=True,
+                padding_value=-100,
+                padding_side="left",
+            )
+        else:
+            labels = torch.full_like(input_ids, fill_value=-100, dtype=torch.long)
 
         batch = {
-            "data_indices": [instance["data_index"] for instance in instances],
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
@@ -113,9 +141,24 @@ class DataCollator(object):
             **self._collate_mm_inputs(instances),
         }
 
+        if "actions" in instances[0]:
+            batch["actions"] = torch.cat([instance["actions"] for instance in instances], dim=0)
+
+        if "action_mask" in instances[0]:
+            batch["action_mask"] = torch.cat([instance["action_mask"] for instance in instances], dim=0)
+
+        if "states" in instances[0]:
+            batch["states"] = torch.cat([instance["states"] for instance in instances], dim=0)
+
+        if "data_index" in instances[0]:
+            batch["data_indices"] = [instance["data_index"] for instance in instances]
+
         return batch
 
     def __call__(self, instances: List[Dict[str, Any]]):
         if self.sequence_packing:
-            return self._collate_fn_packing(instances)
-        return self._collate_fn_padding(instances)
+            batch = self._collate_fn_packing(instances)
+        else:
+            batch = self._collate_fn_padding(instances)
+        batch["use_cache"] = False
+        return batch

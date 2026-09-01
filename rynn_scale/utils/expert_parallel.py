@@ -1,15 +1,14 @@
-import inspect
-import os
-from typing import Any, List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
-from deepspeed.moe.layer import MoE
-from deepspeed.utils import groups
+import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.tensor import Shard
 
 from .. import parallel_state as mpu
+from ..constants import MOE_DISPATCH_BACKEND
 from ..ops import all_to_all, deepep_combine, deepep_dispatch, moe_token_permute, moe_token_unpermute
-
-MOE_DISPATCH_BACKEND = os.environ.get("MOE_DISPATCH_BACKEND", "deep_ep")
 
 
 class MoETokenDispatcher(object):
@@ -44,12 +43,15 @@ class MoETokenDispatcher(object):
     ) -> Tuple[torch.Tensor, List[int]]:
         assert hidden_states.ndim == 2
         assert expert_indices.ndim == 2
-        expert_indices = expert_indices.flatten()
 
-        self.token_indices = torch.argsort(expert_indices, stable=True)
-        hidden_states = hidden_states.index_select(0, self.token_indices // self.num_experts_per_token)
+        num_tokens = torch.bincount(expert_indices.flatten(), minlength=self.num_experts)
 
-        num_tokens = torch.bincount(expert_indices, minlength=self.num_experts)
+        hidden_states, self.permuted_indices = moe_token_permute(
+            hidden_states,
+            routed_expert_indices=expert_indices,
+            num_routed_tokens=num_tokens.tolist(),
+            num_experts_per_token=self.num_experts_per_token,
+        )
 
         if self.ep_group is not None:
             input_split_sizes = num_tokens.view(self.ep_world_size, -1).sum(1).tolist()
@@ -94,8 +96,6 @@ class MoETokenDispatcher(object):
         return hidden_states, num_tokens_list
 
     def _combine_a2a(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_size = hidden_states.size(-1)
-
         if self.ep_group is not None:
             hidden_states = torch.zeros_like(hidden_states).index_copy_(0, self.global_token_indices, hidden_states)
             hidden_states = all_to_all(
@@ -105,14 +105,14 @@ class MoETokenDispatcher(object):
                 group=self.ep_group,
             )
 
-        outputs = hidden_states.new_zeros((self.token_indices.numel(), hidden_size))
-        outputs.index_copy_(0, self.token_indices, hidden_states)
-        outputs = outputs.view(-1, self.num_experts_per_token, hidden_size)
+        outputs = moe_token_unpermute(
+            hidden_states,
+            probs=self.routing_scores,
+            permuted_indices=self.permuted_indices,
+            num_experts_per_token=self.num_experts_per_token,
+        )
 
-        outputs = outputs * self.routing_scores.unsqueeze(-1)
-        outputs = outputs.sum(dim=1)
-
-        self.token_indices = None
+        self.permuted_indices = None
         self.global_token_indices = None
         self.routing_scores = None
 
@@ -207,101 +207,70 @@ class MoETokenDispatcher(object):
             raise ValueError
 
 
-class BaseMoELayer(MoE):
-    def __init__(self, num_experts: int):
-        super(MoE, self).__init__()
-
-        self.ep_group = mpu.get_expert_model_parallel_group()
-        self.ep_world_size = mpu.get_expert_model_parallel_world_size()
-        self.ep_rank = mpu.get_expert_model_parallel_rank()
-
-        assert num_experts % self.ep_world_size == 0
-
-        # To ensure compatibility with DeepSpeed
-        self.num_experts = num_experts
-        self.expert_group_name = f"ep_size_{self.ep_world_size}"
-        self.enable_expert_tensor_parallelism = False
-
-    def set_deepspeed_parallelism(self, use_data_before_expert_parallel_: bool = False) -> None:
-        if use_data_before_expert_parallel_:
-            raise NotImplementedError()
-
-        # https://github.com/deepspeedai/DeepSpeed/blob/fffcf2f56925c00a34d74fec0be523a3aec479a8/deepspeed/moe/layer.py#L91
-        if self.expert_group_name not in groups._get_expert_parallel_group_dict():
-            print(f"No existing process group found, creating a new group named: {self.expert_group_name}")
-            if (groups.mpu is None) or (not self.enable_expert_tensor_parallelism):
-                # Condition 1 - no groups.mpu means no tensor parallelism
-                # Condition 2 - disabling expert tensor parallelism on purpose
-                groups._create_expert_and_data_parallel(
-                    self.ep_world_size, use_data_before_expert_parallel_=use_data_before_expert_parallel_
-                )
-            else:
-                # expert tensor parallelism is enabled
-                groups._create_expert_data_and_model_parallel(
-                    self.ep_world_size,
-                    mpu=groups.mpu,
-                    use_data_before_expert_parallel_=use_data_before_expert_parallel_,
-                )
-
-    def mark_moe_parameters(self):
-        for p in self.parameters():
-            p.allreduce = False
-            p.group_name = self.expert_group_name
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        super().__setattr__(name, value)
-        self.mark_moe_parameters()
-
-    def _apply(self, *args, **kwargs):
-        output = super()._apply(*args, **kwargs)
-        self.mark_moe_parameters()
-        return output
-
-
-def gather_ep_params(
-    model: torch.nn.Module,
-    convert: bool = True,
+def fully_shard_experts(
+    experts: nn.Module,
+    *,
+    edp_mesh: DeviceMesh,
+    ep_degree: int,
+    mp_policy: MixedPrecisionPolicy,
+    reshard_after_forward: bool = False,
 ):
-    if "convert" in inspect.signature(model.state_dict).parameters:
-        state_dict = model.state_dict(convert=convert)
-    else:
-        state_dict = model.state_dict()
+    shard_placement_fn = None
+    if edp_mesh.size() * ep_degree > experts.num_experts:
+        shard_placement_fn = lambda param: Shard(1)  # noqa: E731
 
-    if mpu.get_expert_data_parallel_rank() != 0:
-        torch.distributed.barrier()
-        return state_dict
+    fully_shard(
+        experts,
+        mesh=edp_mesh,
+        mp_policy=mp_policy,
+        reshard_after_forward=reshard_after_forward,
+        shard_placement_fn=shard_placement_fn,
+    )
 
-    ep_group = mpu.get_expert_model_parallel_group()
-    ep_size = mpu.get_expert_model_parallel_world_size()
-    ep_rank = mpu.get_expert_model_parallel_rank()
+    # Align experts' grad divisor with the non-expert FSDP modules: their mesh
+    # is ``dp_mesh`` (= ``edp_mesh`` x ``ep``), so without this override
+    # experts would be off by a factor of ``ep_degree``.
+    experts.set_gradient_divide_factor(edp_mesh.size() * ep_degree)
 
-    expert_param_names = set()
-    for module_name, module in model.named_modules():
-        if isinstance(module, BaseMoELayer):
-            for key in state_dict:
-                if key.startswith(module_name):
-                    expert_param_names.add(key)
 
-    for param_name in sorted(state_dict.keys()):
-        if param_name not in expert_param_names:
-            continue
+def set_moe_fsdp_prefetch(
+    layers: Sequence[nn.Module],
+    experts_modules: Sequence[Optional[nn.Module]] = (),
+    *,
+    pre_module: Optional[nn.Module] = None,
+    post_modules: Sequence[nn.Module] = (),
+) -> None:
+    layers = list(layers)
+    if not layers:
+        return
 
-        param = state_dict[param_name].cuda()
-        if ep_rank == 0:
-            outputs = [torch.empty_like(param) for _ in range(ep_size)]
-        else:
-            outputs = None
+    if not experts_modules:
+        experts_modules = [None] * len(layers)
+    assert len(experts_modules) == len(layers), (
+        f"experts_modules has {len(experts_modules)} entries but layers has {len(layers)}"
+    )
 
-        torch.distributed.gather(
-            param,
-            outputs,
-            group=ep_group,
-            group_dst=0,
-        )
+    if pre_module is not None:
+        pre_module.set_modules_to_forward_prefetch([layers[0]])
 
-        if ep_rank == 0:
-            new_param = torch.cat(outputs, dim=0)
-            state_dict[param_name] = new_param.cpu()
+    for i, layer in enumerate(layers):
+        if i + 1 < len(layers):
+            modules = [layers[i + 1]]
+            if experts_modules[i + 1] is not None:
+                modules.append(experts_modules[i + 1])
+            layer.set_modules_to_forward_prefetch(modules)
+        elif post_modules:
+            layer.set_modules_to_forward_prefetch(list(post_modules))
 
-    torch.distributed.barrier()
-    return state_dict
+    if post_modules:
+        post_modules[-1].set_modules_to_backward_prefetch([layers[-1]])
+
+    for i in range(len(layers) - 1, -1, -1):
+        layer = layers[i]
+        if i - 1 >= 0:
+            modules = [layers[i - 1]]
+            if experts_modules[i - 1] is not None:
+                modules.append(experts_modules[i - 1])
+            layer.set_modules_to_backward_prefetch(modules)
+        elif pre_module is not None:
+            layer.set_modules_to_backward_prefetch([pre_module])

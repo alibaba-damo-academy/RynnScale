@@ -1,12 +1,10 @@
-import os
 from typing import List
 
 import torch
 import triton
 import triton.language as tl
 
-MOE_GEMM_BACKEND = os.environ.get("MOE_GEMM_BACKEND", "cutlass")
-
+from ..constants import MOE_GEMM_BACKEND
 
 try:
     from . import _C

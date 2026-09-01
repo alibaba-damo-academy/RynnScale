@@ -1,4 +1,4 @@
-from typing import Any, List, Dict
+from typing import Any, Dict, List
 
 from rynn_scale.datasets.vlm_datasets import VLMDataset
 from rynn_scale.registry import DATASET_REGISTRY

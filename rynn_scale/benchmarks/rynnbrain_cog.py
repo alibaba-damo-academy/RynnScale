@@ -1,11 +1,11 @@
+import json
 import os
 import re
-import json
 from collections import defaultdict
 from typing import Any, Dict, List, Union
 
-from .base import BaseBenchmark
 from ..registry import BENCHMARK_REGISTRY
+from .base import BaseBenchmark
 
 TASKS = {
     "object_conigtion": "rynnbrain_object_2000.jsonl",
@@ -16,7 +16,6 @@ TASKS = {
 
 @BENCHMARK_REGISTRY.register()
 class RynnBrainCog(BaseBenchmark):
-
     # THINKING_MODE = True
     THINKING_MODE = False
 
@@ -89,11 +88,11 @@ class RynnBrainCog(BaseBenchmark):
         Load data from jsonl files.
         """
         data_dict = {}
-        
+
         for task_name, json_path in TASKS.items():
             data_path = os.path.join(data_root, json_path)
             data_folder = os.path.join(data_root, "data")
-            
+
             # print('data_path', data_path)
             data_list = self._load_jsonl_file(data_path)
             # print('len(data_list)',len(data_list))
@@ -111,13 +110,17 @@ class RynnBrainCog(BaseBenchmark):
                 for msg in conversation:
                     if msg["role"] == "assistant":
                         # print('msg["content"]', msg["content"])
-                        assistant_content = msg.get('content', [])
+                        assistant_content = msg.get("content", [])
                         answer = assistant_content[-1].get("text", "") if assistant_content else ""
                     elif msg["role"] == "user":
-                        user_content = msg.get('content', [])
-                        image_path = [os.path.join(data_folder, item['image']) for item in user_content if item.get('type') == 'image']
+                        user_content = msg.get("content", [])
+                        image_path = [
+                            os.path.join(data_folder, item["image"])
+                            for item in user_content
+                            if item.get("type") == "image"
+                        ]
                         question = user_content[-1].get("text", "") if user_content else ""
-                
+
                 data_dict[data_id] = {
                     "images": image_path,
                     "ground_truth": answer,
@@ -144,9 +147,9 @@ class RynnBrainCog(BaseBenchmark):
             else f"{question}"
         )
 
-        if self.THINKING_MODE and task_type in ['counting']:
-            thinking_prompt = f"\nOutput format: `#### <answer><counting>N</counting></answer>` where N is the count."
-            question = f'{question}{thinking_prompt}'
+        if self.THINKING_MODE and task_type in ["counting"]:
+            thinking_prompt = "\nOutput format: `#### <answer><counting>N</counting></answer>` where N is the count."
+            question = f"{question}{thinking_prompt}"
             self.SYSTEM_PROMPT = SYSTEM_PROMPT_COUNTING
 
         if isinstance(question, str):
@@ -155,15 +158,17 @@ class RynnBrainCog(BaseBenchmark):
             content = []
             for i, path in enumerate(image_path):
                 content.append({"type": "text", "text": f"<frame {i}>: "})
-                content.append({"type": "image", "image": path})  
+                content.append({"type": "image", "image": path})
 
             messages = []
             if self.THINKING_MODE:
                 messages.append({"role": "system", "content": self.SYSTEM_PROMPT})
-            messages.append({
+            messages.append(
+                {
                     "role": "user",
                     "content": content + [{"type": "text", "text": question}],
-            })
+                }
+            )
             # print('messages', messages)
 
         return messages
@@ -172,7 +177,7 @@ class RynnBrainCog(BaseBenchmark):
         """Process the raw model response."""
         # Normalize the response similarly to the ground truth for fair comparison
         if self.THINKING_MODE:
-            match = re.findall(r'<answer><counting>(.*?)</counting></answer>', response, re.DOTALL)
+            match = re.findall(r"<answer><counting>(.*?)</counting></answer>", response, re.DOTALL)
             response = match[0].strip() if match else response
         return response.strip()
 
@@ -193,7 +198,7 @@ class RynnBrainCog(BaseBenchmark):
             "type": task_type,
         }
         score = await calculate_score(record, self.openai_client)
-        print(f'| dataid: {data_id} | answer: {ground_truth} | pred: {prediction} | score: {score} |')
+        print(f"| dataid: {data_id} | answer: {ground_truth} | pred: {prediction} | score: {score} |")
         return score
 
     def compute_metrics(self, results):
@@ -244,6 +249,7 @@ class RynnBrainCog(BaseBenchmark):
         return metrics
         # return self._summarize_scores(results, category_key="task_type")
 
+
 SYSTEM_PROMPT_COUNTING = [
     {
         "type": "text",
@@ -252,7 +258,7 @@ SYSTEM_PROMPT_COUNTING = [
             # "Put your final answer in the format of `#### <answer><counting>N</counting></answer>`."
         ),
     }
-]   
+]
 
 SCORE_TYPE = {
     "camera_rotation": "numerical",
@@ -299,7 +305,7 @@ SCORE_TYPE = {
     "size": "gpt_multi_granularity",
 }
 
-UNIT_LIST = ["centimeters", "meters", "feet", "inches", "degrees", "o\'clock"]
+UNIT_LIST = ["centimeters", "meters", "feet", "inches", "degrees", "o'clock"]
 
 UNIT_EXCHANGE = {
     "length": {"centimeters": 100.0, "meters": 1.0, "inches": 39.3701, "feet": 3.28084},

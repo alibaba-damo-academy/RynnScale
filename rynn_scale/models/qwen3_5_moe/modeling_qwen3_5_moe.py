@@ -4,42 +4,64 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
+from torch.distributed.fsdp import fully_shard
+from torch.distributed.tensor import DTensor, Shard
 from transformers.activations import ACT2FN
-from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
-    Qwen3_5MoeConfig,
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeAttention as _Qwen3_5MoeAttention,
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeDecoderLayer,
-    Qwen3_5MoeForConditionalGeneration,
-    Qwen3_5MoeModel,
-    Qwen3_5MoeTextModel,
     Qwen3_5MoeTextRotaryEmbedding,
-    Qwen3_5MoeVisionModel,
+)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeForConditionalGeneration as _Qwen3_5MoeForConditionalGeneration,
+)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeModel as _Qwen3_5MoeModel,
+)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeTextModel as _Qwen3_5MoeTextModel,
+)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeVisionModel as _Qwen3_5MoeVisionModel,
 )
 
 from ...ops import grouped_linear
-from ...utils.expert_parallel import BaseMoELayer, MoETokenDispatcher
-from ..qwen3_5.modeling_qwen3_5 import (
-    _Qwen3_5ForConditionalGeneration,
-    _Qwen3_5Model,
-    _Qwen3_5RMSNorm,
-    _Qwen3_5TextModel,
-    _Qwen3_5VisionModel,
+from ...utils.expert_parallel import (
+    MoETokenDispatcher,
+    fully_shard_experts,
+    set_moe_fsdp_prefetch,
 )
+from ..qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5Attention,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5Model,
+    Qwen3_5MultiTokenPredictionModule,
+    Qwen3_5RMSNorm,
+    Qwen3_5TextModel,
+    Qwen3_5VisionModel,
+    apply_rotary_pos_emb_vision,
+)
+from .configuration_qwen3_5_moe import Qwen3_5MoeConfig
 
 
-class _Qwen3_5MoeVisionModel(Qwen3_5MoeVisionModel):
-    forward = _Qwen3_5VisionModel.forward
-    floating_point_ops = _Qwen3_5VisionModel.floating_point_ops
+class Qwen3_5MoeAttention(_Qwen3_5MoeAttention):
+    forward = Qwen3_5Attention.forward
+
+
+class Qwen3_5MoeVisionModel(_Qwen3_5MoeVisionModel):
+    forward = Qwen3_5VisionModel.forward
+    floating_point_ops = Qwen3_5VisionModel.floating_point_ops
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gradient_checkpointing_interval = None
 
 
-class _Qwen3_5MoeExperts(BaseMoELayer):
+class Qwen3_5MoeExperts(nn.Module):
     def __init__(self, config):
-        super().__init__(config.num_experts)
+        super().__init__()
 
         self.num_experts = config.num_experts
         self.hidden_dim = config.hidden_size
@@ -64,9 +86,16 @@ class _Qwen3_5MoeExperts(BaseMoELayer):
             hidden_states, top_k_index, top_k_weights
         )
 
+        gate_up_proj = self.gate_up_proj
+        down_proj = self.down_proj
+        if isinstance(gate_up_proj, DTensor):
+            gate_up_proj = gate_up_proj.to_local()
+        if isinstance(down_proj, DTensor):
+            down_proj = down_proj.to_local()
+
         gate_up = grouped_linear(
             input=hidden_states,
-            weight=self.gate_up_proj,
+            weight=gate_up_proj,
             input_group_sizes=num_tokens_per_expert,
         )
         gate, up = gate_up.chunk(2, dim=-1)
@@ -74,7 +103,7 @@ class _Qwen3_5MoeExperts(BaseMoELayer):
 
         hidden_states = grouped_linear(
             input=hidden_states,
-            weight=self.down_proj,
+            weight=down_proj,
             input_group_sizes=num_tokens_per_expert,
         )
 
@@ -83,15 +112,15 @@ class _Qwen3_5MoeExperts(BaseMoELayer):
         return hidden_states
 
 
-class _Qwen3_5MoeRMSNorm(_Qwen3_5RMSNorm):
+class Qwen3_5MoeRMSNorm(Qwen3_5RMSNorm):
     pass
 
 
-class _Qwen3_5MoeTextModel(Qwen3_5MoeTextModel):
-    forward = _Qwen3_5TextModel.forward
+class Qwen3_5MoeTextModel(_Qwen3_5MoeTextModel):
+    forward = Qwen3_5TextModel.forward
 
     def __init__(self, config):
-        super(Qwen3_5MoeTextModel, self).__init__(config)
+        super(_Qwen3_5MoeTextModel, self).__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleDict(
             {
@@ -99,7 +128,7 @@ class _Qwen3_5MoeTextModel(Qwen3_5MoeTextModel):
                 for layer_idx in range(config.num_hidden_layers)
             }
         )
-        self.norm = _Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -143,35 +172,163 @@ class _Qwen3_5MoeTextModel(Qwen3_5MoeTextModel):
         return flops
 
 
-class _Qwen3_5MoeModel(Qwen3_5MoeModel):
-    get_multimodal_features = _Qwen3_5Model.get_multimodal_features
-    get_placeholder_mask = _Qwen3_5Model.get_placeholder_mask
-    forward = _Qwen3_5Model.forward
-    floating_point_ops = _Qwen3_5Model.floating_point_ops
-    apply_pipeline_parallel = _Qwen3_5Model.apply_pipeline_parallel
+class Qwen3_5MoeModel(_Qwen3_5MoeModel):
+    get_multimodal_features = Qwen3_5Model.get_multimodal_features
+    get_placeholder_mask = Qwen3_5Model.get_placeholder_mask
+    forward = Qwen3_5Model.forward
+    floating_point_ops = Qwen3_5Model.floating_point_ops
+    apply_pipeline_parallel = Qwen3_5Model.apply_pipeline_parallel
 
-    def apply_expert_parallel(self, ep_world_size: int, ep_rank: int):
+    def apply_expert_parallel(self, expert_device_mesh: torch.distributed.DeviceMesh):
+        ep_mesh = expert_device_mesh["ep"]
+        ep_world_size = ep_mesh.size()
+        ep_rank = ep_mesh.get_local_rank()
         assert self.config.text_config.num_experts % ep_world_size == 0
         for module in self.modules():
-            if isinstance(module, _Qwen3_5MoeExperts):
-                for name, param in module.named_parameters():
-                    new_param = nn.Parameter(param.data.chunk(ep_world_size, dim=0)[ep_rank])
-                    del param
+            if isinstance(module, Qwen3_5MoeExperts):
+                for name, param in list(module.named_parameters(recurse=False)):
+                    local_shard = param.data.chunk(ep_world_size, dim=0)[ep_rank].contiguous()
+                    dtensor = DTensor.from_local(
+                        local_shard,
+                        device_mesh=ep_mesh,
+                        placements=[Shard(0)],
+                        run_check=False,
+                    )
+                    new_param = nn.Parameter(dtensor)
                     module.register_parameter(name, new_param)
 
+    def apply_fully_sharded_data_parallel(
+        self,
+        device_mesh: torch.distributed.DeviceMesh,
+        expert_device_mesh: torch.distributed.DeviceMesh,
+        mp_policy: torch.distributed.fsdp.MixedPrecisionPolicy,
+        reshard_after_forward: bool = False,
+    ):
+        dp_mesh = device_mesh["dp"]
+        ep_degree = expert_device_mesh["ep"].size()
+        edp_mesh = expert_device_mesh["dp"] if ep_degree > 1 else None
+        fsdp_config = {
+            "mesh": dp_mesh,
+            "reshard_after_forward": reshard_after_forward,
+            "mp_policy": mp_policy,
+        }
 
-class _Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
+        if hasattr(self, "visual"):
+            fully_shard(self.visual, **fsdp_config)
+
+        if hasattr(self.language_model, "embed_tokens"):
+            fully_shard(self.language_model.embed_tokens, **fsdp_config)
+
+        layers = list(self.language_model.layers.values())
+        experts_modules = [layer.mlp.experts for layer in layers]
+        for layer, experts in zip(layers, experts_modules):
+            if ep_degree > 1:
+                fully_shard_experts(
+                    experts,
+                    edp_mesh=edp_mesh,
+                    ep_degree=ep_degree,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=reshard_after_forward,
+                )
+            fully_shard(layer, **fsdp_config)
+
+        if hasattr(self.language_model, "norm"):
+            fully_shard(self.language_model.norm, **fsdp_config)
+
+        fully_shard(self, **fsdp_config)
+
+        if ep_degree > 1:
+            set_moe_fsdp_prefetch(
+                layers,
+                experts_modules,
+                pre_module=getattr(self.language_model, "embed_tokens", None),
+                post_modules=[m for m in (getattr(self.language_model, "norm", None),) if m is not None],
+            )
+
+
+class Qwen3_5MoeForConditionalGeneration(_Qwen3_5MoeForConditionalGeneration):
     accepts_loss_kwargs = True
 
-    forward = _Qwen3_5ForConditionalGeneration.forward
-    floating_point_ops = _Qwen3_5ForConditionalGeneration.floating_point_ops
-    apply_pipeline_parallel = _Qwen3_5ForConditionalGeneration.apply_pipeline_parallel
+    forward = Qwen3_5ForConditionalGeneration.forward
+    floating_point_ops = Qwen3_5ForConditionalGeneration.floating_point_ops
+    apply_pipeline_parallel = Qwen3_5ForConditionalGeneration.apply_pipeline_parallel
 
-    def apply_expert_parallel(self, ep_world_size: int, ep_rank: int):
-        self.model.apply_expert_parallel(
-            ep_world_size=ep_world_size,
-            ep_rank=ep_rank,
-        )
+    def __init__(self, config):
+        super().__init__(config)
+        # MTP module shares the qwen3_5 dense implementation; only built when
+        # the user enables the auxiliary MTP loss via config.mtp_loss_weight.
+        if getattr(self.config, "mtp_loss_weight", 0) > 0:
+            self.mtp = Qwen3_5MultiTokenPredictionModule(config)
+
+    def apply_expert_parallel(self, expert_device_mesh: torch.distributed.DeviceMesh):
+        self.model.apply_expert_parallel(expert_device_mesh=expert_device_mesh)
+
+    def apply_fully_sharded_data_parallel(
+        self,
+        device_mesh: torch.distributed.DeviceMesh,
+        expert_device_mesh: torch.distributed.DeviceMesh,
+        mp_policy: torch.distributed.fsdp.MixedPrecisionPolicy,
+        reshard_after_forward: bool = False,
+    ):
+        dp_mesh = device_mesh["dp"]
+        ep_degree = expert_device_mesh["ep"].size()
+        edp_mesh = expert_device_mesh["dp"] if ep_degree > 1 else None
+        fsdp_config = {
+            "mesh": dp_mesh,
+            "reshard_after_forward": reshard_after_forward,
+            "mp_policy": mp_policy,
+        }
+
+        if hasattr(self.model, "visual"):
+            fully_shard(self.model.visual, **fsdp_config)
+
+        if hasattr(self.model.language_model, "embed_tokens"):
+            if self.config.tie_word_embeddings and hasattr(self, "lm_head"):
+                fully_shard(
+                    [self.model.language_model.embed_tokens, self.lm_head],
+                    **fsdp_config,
+                )
+            else:
+                fully_shard(self.model.language_model.embed_tokens, **fsdp_config)
+                if hasattr(self, "lm_head"):
+                    fully_shard(self.lm_head, **fsdp_config)
+
+        layers = list(self.model.language_model.layers.values())
+        experts_modules = [layer.mlp.experts for layer in layers]
+        for layer, experts in zip(layers, experts_modules):
+            if ep_degree > 1:
+                fully_shard_experts(
+                    experts,
+                    edp_mesh=edp_mesh,
+                    ep_degree=ep_degree,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=reshard_after_forward,
+                )
+            fully_shard(layer, **fsdp_config)
+
+        if hasattr(self.model.language_model, "norm"):
+            fully_shard(self.model.language_model.norm, **fsdp_config)
+
+        if hasattr(self, "mtp"):
+            fully_shard(self.mtp, **fsdp_config)
+
+        fully_shard(self, **fsdp_config)
+
+        if ep_degree > 1:
+            post_modules = [
+                m
+                for m in (
+                    getattr(self.model.language_model, "norm", None),
+                    self.lm_head if hasattr(self, "lm_head") and not self.config.tie_word_embeddings else None,
+                )
+                if m is not None
+            ]
+            set_moe_fsdp_prefetch(
+                layers,
+                experts_modules,
+                pre_module=getattr(self.model.language_model, "embed_tokens", None),
+                post_modules=post_modules,
+            )
 
     def load_state_dict(
         self,
@@ -206,17 +363,19 @@ class _Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
 
 
 def apply_monkey_patch():
-    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeVisionModel = _Qwen3_5MoeVisionModel
-    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm = _Qwen3_5MoeRMSNorm
-    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeExperts = _Qwen3_5MoeExperts
-    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeTextModel = _Qwen3_5MoeTextModel
+    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeAttention = Qwen3_5MoeAttention
+    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.apply_rotary_pos_emb_vision = apply_rotary_pos_emb_vision
+    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeVisionModel = Qwen3_5MoeVisionModel
+    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm = Qwen3_5MoeRMSNorm
+    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeExperts = Qwen3_5MoeExperts
+    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeTextModel = Qwen3_5MoeTextModel
 
-    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeModel = _Qwen3_5MoeModel
-    transformers.models.auto.modeling_auto.MODEL_MAPPING[Qwen3_5MoeConfig] = _Qwen3_5MoeModel
+    transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeModel = Qwen3_5MoeModel
+    transformers.models.auto.modeling_auto.MODEL_MAPPING[Qwen3_5MoeConfig] = Qwen3_5MoeModel
 
     transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeForConditionalGeneration = (
-        _Qwen3_5MoeForConditionalGeneration
+        Qwen3_5MoeForConditionalGeneration
     )
     transformers.models.auto.modeling_auto.MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING[Qwen3_5MoeConfig] = (
-        _Qwen3_5MoeForConditionalGeneration
+        Qwen3_5MoeForConditionalGeneration
     )

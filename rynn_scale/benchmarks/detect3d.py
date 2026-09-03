@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 from tqdm import tqdm
 
+from ..inference_wrappers import BaseInferenceWrapper
 from ..registry import BENCHMARK_REGISTRY
 from .base import BaseBenchmark
 
@@ -414,6 +415,7 @@ class Detect3D(BaseBenchmark):
     def __init__(
         self,
         data_root: str,
+        inference_wrapper: BaseInferenceWrapper,
         prompt_format: Optional[str] = None,
         enable_thinking: bool = False,
         iou_thresholds: Optional[List[float]] = None,
@@ -425,7 +427,12 @@ class Detect3D(BaseBenchmark):
         self._categories: Dict[int, str] = {}
         self._cat_name_to_id: Dict[str, int] = {}
         self._prompt_cache: Dict[Union[int, str], Dict[str, Any]] = {}
-        super().__init__(data_root, prompt_format, enable_thinking)
+        super().__init__(
+            data_root=data_root,
+            inference_wrapper=inference_wrapper,
+            prompt_format=prompt_format,
+            enable_thinking=enable_thinking,
+        )
 
     @staticmethod
     def _resolve_image_path(data_root: str, file_path: str) -> str:

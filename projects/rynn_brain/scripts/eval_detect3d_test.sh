@@ -15,8 +15,7 @@ ARGS=(
     --model_path $MODEL_PATH
     --benchmarks Detect3D
     --save_dir "$save_dir"
-    --backend hf
-    --num_processor_workers 4
+    --engine hf
     --image_min_pixels $((16 * 32 * 32))
     --image_max_pixels $((16384 * 32 * 32))
     --max_new_tokens 512

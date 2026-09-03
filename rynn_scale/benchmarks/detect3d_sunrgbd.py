@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 import numpy as np
 
+from ..inference_wrappers import BaseInferenceWrapper
 from ..registry import BENCHMARK_REGISTRY
 from .base import BaseBenchmark
 
@@ -444,13 +445,19 @@ class Detect3DSUNRGBD(BaseBenchmark):
     def __init__(
         self,
         data_root: str,
+        inference_wrapper: BaseInferenceWrapper,
         prompt_format: Optional[str] = None,
         enable_thinking: bool = False,
         parse_json: bool = False,
     ) -> None:
         self._gt_by_data_id: Dict[str, Dict] = {}
         self.parse_json = parse_json
-        super().__init__(data_root, prompt_format, enable_thinking)
+        super().__init__(
+            data_root=data_root,
+            inference_wrapper=inference_wrapper,
+            prompt_format=prompt_format,
+            enable_thinking=enable_thinking,
+        )
 
     def load_data(self, data_root: str) -> Dict[Union[int, str], Any]:
         import scipy.io as sio

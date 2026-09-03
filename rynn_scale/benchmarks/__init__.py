@@ -29,6 +29,8 @@ from .share_robot import ShareRobot
 from .video_mme import VideoMME
 from .vsibench import VSIBench
 from .where2place import Where2Place
+from .detect3d import Detect3D, Detect3DQwen, Detect3DTrain
+from .detect3d_sunrgbd import Detect3DSUNRGBD
 
 
 def build_benchmark(
